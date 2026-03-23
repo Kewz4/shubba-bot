@@ -42,8 +42,8 @@ http.createServer((req, res) => {
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'MTQ2NTE2NTIzNzM1ODU1OTM4Ng.GzMjzR.O8YH-fJay2D-4NiVSBA0fnra4c4AlpHGpfK1FA'; 
 const CLIENT_ID = process.env.CLIENT_ID || '1465165237358559386'; 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyB-umYe0W2nl1y7jf_fZ-X2kmlfIuSbbc4';
-const GEMINI_FLASH_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
-const GEMINI_THINKING_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-thinking-exp-01-21:generateContent?key=${GEMINI_API_KEY}`;
+// Gemini 2.5 Flash — smarter reasoning, built-in thinking, very cost-effective
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 /**
  * Determine if a task needs advanced thinking or can use flash response
@@ -95,51 +95,38 @@ function shouldUseThinking(content, hasLogFile = false, isDeepAnalysis = false) 
 }
 
 /**
- * Call Gemini with smart model selection and fallback
+ * Call Gemini 2.5 Flash with automatic retry on transient failures.
+ * The useThinking parameter is accepted for compatibility but the model
+ * handles reasoning internally — no separate thinking endpoint needed.
  */
 async function callGemini(prompt, useThinking = false) {
-    const attemptCall = async (url, timeout, maxTokens, label) => {
-        return geminiLimiter.execute(async () => {
-            const res = await axios.post(url, {
-                contents: [{ parts: [{ text: prompt }] }],
-                generationConfig: {
-                    temperature: 0.7,
-                    maxOutputTokens: maxTokens
-                }
-            }, {
-                timeout,
-                maxContentLength: 100 * 1024 * 1024
-            });
+    console.log(`🤖 Calling Gemini 2.5 Flash`);
 
-            // Thinking models return thought parts first, then the actual response.
-            // Always grab the last non-thought part so we never return raw thinking text.
-            const parts = res.data.candidates[0].content.parts;
-            const responsePart = parts.slice().reverse().find(p => !p.thought && p.text) || parts[parts.length - 1];
-            return responsePart.text;
-        });
-    };
-
-    if (useThinking) {
-        console.log(`🤖 Using Gemini Thinking Mode`);
-        try {
-            return await attemptCall(GEMINI_THINKING_URL, 180000, 8192, "Thinking Mode");
-        } catch (thinkingErr) {
-            // Thinking model failed (often experimental instability) — fall back to Flash
-            console.warn(`⚠️ Thinking model failed (${thinkingErr.message}), falling back to Flash...`);
-        }
-    }
-
-    console.log(`🤖 Using Gemini Flash Mode`);
-    // Retry Flash up to 2 times with exponential backoff before giving up
     let lastErr;
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
-            return await attemptCall(GEMINI_FLASH_URL, 90000, 4096, "Flash Mode");
+            return await geminiLimiter.execute(async () => {
+                const res = await axios.post(GEMINI_URL, {
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: {
+                        temperature: 0.7,
+                        maxOutputTokens: 8192
+                    }
+                }, {
+                    timeout: 120000,
+                    maxContentLength: 100 * 1024 * 1024
+                });
+
+                // Grab the last non-thought text part (handles thinking-model response format)
+                const parts = res.data.candidates[0].content.parts;
+                const responsePart = parts.slice().reverse().find(p => !p.thought && p.text) || parts[parts.length - 1];
+                return responsePart.text;
+            });
         } catch (err) {
             lastErr = err;
             if (attempt < 2) {
-                const delay = (attempt + 1) * 3000; // 3s, 6s
-                console.warn(`⚠️ Flash attempt ${attempt + 1} failed, retrying in ${delay / 1000}s...`);
+                const delay = (attempt + 1) * 3000; // 3 s, 6 s
+                console.warn(`⚠️ Gemini attempt ${attempt + 1} failed (${err.message}), retrying in ${delay / 1000}s...`);
                 await new Promise(r => setTimeout(r, delay));
             }
         }
@@ -2558,14 +2545,14 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
         console.log(`🔔 Bot was mentioned in paused/human help/solved thread ${thread.name} - will respond`);
     }
     
-    // Add thread to managed set if mentioned
+    // In follow-up messages, only respond when an owner explicitly @mentions Shubba
     if (isMentioned && !managedThreads.has(thread.id)) {
         managedThreads.add(thread.id);
         console.log(`📌 Added thread ${thread.name} to managed threads`);
     }
 
-    // Only respond in managed threads
-    if (managedThreads.has(thread.id) && thread.id !== message.id) {
+    // Only respond to owner @mentions in threads (ThreadCreate handles the initial auto-response)
+    if (isMentioned && isOwner) {
         // Analyze conversation dynamics - who's talking to whom?
         const dynamics = await analyzeConversationDynamics(message);
         console.log(`💬 Conversation type: ${dynamics.conversationType} - ${dynamics.contextNote}`);
