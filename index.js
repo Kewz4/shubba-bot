@@ -5,19 +5,20 @@
  * NEW: Teaser video auto-hosting to Google Cloud Storage
  */
 
-const { 
-    Client, 
-    GatewayIntentBits, 
-    Events, 
-    ActionRowBuilder, 
-    ButtonBuilder, 
+const {
+    Client,
+    GatewayIntentBits,
+    Events,
+    ActionRowBuilder,
+    ButtonBuilder,
     ButtonStyle,
-    SlashCommandBuilder, 
-    REST, 
-    Routes, 
+    SlashCommandBuilder,
+    REST,
+    Routes,
     PermissionFlagsBits,
     MessageFlags,
-    AttachmentBuilder
+    AttachmentBuilder,
+    EmbedBuilder
 } = require('discord.js');
 const axios = require('axios');
 const http = require('http');
@@ -94,28 +95,56 @@ function shouldUseThinking(content, hasLogFile = false, isDeepAnalysis = false) 
 }
 
 /**
- * Call Gemini with smart model selection
+ * Call Gemini with smart model selection and fallback
  */
 async function callGemini(prompt, useThinking = false) {
-    const url = useThinking ? GEMINI_THINKING_URL : GEMINI_FLASH_URL;
-    const modelName = useThinking ? "Thinking Mode" : "Flash Mode";
-    
-    console.log(`🤖 Using Gemini ${modelName}`);
-    
-    return geminiLimiter.execute(async () => {
-        const res = await axios.post(url, { 
-            contents: [{ parts: [{ text: prompt }] }],
-            generationConfig: {
-                temperature: 0.7,
-                maxOutputTokens: useThinking ? 8192 : 4096
-            }
-        }, { 
-            timeout: useThinking ? 180000 : 60000, // 3 min for thinking, 1 min for flash
-            maxContentLength: 100 * 1024 * 1024
+    const attemptCall = async (url, timeout, maxTokens, label) => {
+        return geminiLimiter.execute(async () => {
+            const res = await axios.post(url, {
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                    temperature: 0.7,
+                    maxOutputTokens: maxTokens
+                }
+            }, {
+                timeout,
+                maxContentLength: 100 * 1024 * 1024
+            });
+
+            // Thinking models return thought parts first, then the actual response.
+            // Always grab the last non-thought part so we never return raw thinking text.
+            const parts = res.data.candidates[0].content.parts;
+            const responsePart = parts.slice().reverse().find(p => !p.thought && p.text) || parts[parts.length - 1];
+            return responsePart.text;
         });
-        
-        return res.data.candidates[0].content.parts[0].text;
-    });
+    };
+
+    if (useThinking) {
+        console.log(`🤖 Using Gemini Thinking Mode`);
+        try {
+            return await attemptCall(GEMINI_THINKING_URL, 180000, 8192, "Thinking Mode");
+        } catch (thinkingErr) {
+            // Thinking model failed (often experimental instability) — fall back to Flash
+            console.warn(`⚠️ Thinking model failed (${thinkingErr.message}), falling back to Flash...`);
+        }
+    }
+
+    console.log(`🤖 Using Gemini Flash Mode`);
+    // Retry Flash up to 2 times with exponential backoff before giving up
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            return await attemptCall(GEMINI_FLASH_URL, 90000, 4096, "Flash Mode");
+        } catch (err) {
+            lastErr = err;
+            if (attempt < 2) {
+                const delay = (attempt + 1) * 3000; // 3s, 6s
+                console.warn(`⚠️ Flash attempt ${attempt + 1} failed, retrying in ${delay / 1000}s...`);
+                await new Promise(r => setTimeout(r, delay));
+            }
+        }
+    }
+    throw lastErr;
 }
 
 const DEV_GUILD_ID = '1433991244966658072'; 
@@ -136,6 +165,11 @@ const BALLOFGUM_USER_ID = '777561200744595486';
 const TEASERS_CHANNEL_ID = '1441945608993771710';       // Channel Shubba watches for new videos
 const TEASER_OUTPUT_CHANNEL_ID = '1445064610188230736'; // Channel Shubba posts the hosted link to
 const TEASERS_GCS_FOLDER = 'teasers'; // Folder inside your GCS bucket
+
+const GALLERY_CHANNEL_ID = '1451583342972633341';
+const ADDONS_CHANNEL_ID = '1452338871034445844';
+const SUGGESTIONS_CHANNEL_ID = '1433994233567776878';
+const ROADMAP_CHANNEL_ID = '1445072140733780058';
 
 // Discord message link regex: https://discord.com/channels/GUILD/CHANNEL/MESSAGE
 const DISCORD_MSG_LINK_REGEX = /https:\/\/discord\.com\/channels\/(\d+)\/(\d+)\/(\d+)/;
@@ -178,7 +212,7 @@ const MODRINTH_PROJECT_ID = 'punchy-fpa'; // Modrinth project slug
 const MODRINTH_API_BASE = 'https://api.modrinth.com/v2';
 
 // SOLUTIONS STORAGE
-let CURRENT_VERSION_SET = '2.1'; // Current version being documented
+let CURRENT_VERSION_SET = '2.4'; // Current version being documented
 let SOLUTIONS_BY_VERSION = {}; // { '2.1': [...solutions], '2.2': [...solutions] }
 const MAX_SOLUTIONS_PER_VERSION = 50;
 
@@ -2207,6 +2241,13 @@ Examples:
     if (isOwner && isMentioned) {
         console.log(`👑 Owner ${message.author.username} is talking to Shubba`);
 
+        // ── FAQ POST TRIGGER ──────────────────────────────────────────────────
+        if (contentLower.includes('post') && contentLower.includes('faq')) {
+            console.log(`📋 Owner ${message.author.username} requested FAQ post`);
+            await postFAQ(message);
+            return;
+        }
+
         // ── UPLOAD TRIGGER ────────────────────────────────────────────────────
         // If owner attaches a file, pastes a Discord message link, or says
         // "upload" / "host" → run the uploader and exit early.
@@ -2242,10 +2283,15 @@ Examples:
                 
                 conversationContext += "RECENT CONVERSATION:\n";
                 recentMessages.reverse().forEach(msg => {
-                    if (msg.author.id === message.author.id || msg.author.id === client.user.id) {
-                        const speaker = msg.author.id === client.user.id ? "Shubba" : message.author.username;
-                        conversationContext += `${speaker}: ${msg.content.substring(0, 500)}\n`;
+                    // Include ALL participants so Shubba is aware of multi-person conversations
+                    let speaker;
+                    if (msg.author.id === client.user.id) {
+                        speaker = "Shubba";
+                    } else {
+                        speaker = msg.member?.nickname || msg.author.displayName || msg.author.username;
+                        if (DEV_IDS.includes(msg.author.id)) speaker += " [dev]";
                     }
+                    conversationContext += `${speaker}: ${msg.content.substring(0, 500)}\n`;
                 });
             } catch (e) {
                 console.log("⚠️ Couldn't fetch conversation history:", e.message);
@@ -3143,5 +3189,122 @@ function checkTagCompliance(tags) {
 // NOTE: Make sure your GCS bucket allows public reads so hosted URLs work.
 // Run once: gsutil iam ch allUsers:objectViewer gs://shubba-solutions-storage
 // Or set via GCP Console → Storage → Bucket → Permissions → Add allUsers as Storage Object Viewer
+
+// --- POST NEW FAQ ---
+/**
+ * Posts the Punchy! 2.4 FAQ as multiple embeds to the FAQ channel.
+ * Triggered by owner saying "@shubba post the new 2.4 faq".
+ */
+async function postFAQ(triggerMessage) {
+    const faqChannel = await client.channels.fetch(FAQ_CHANNEL_ID);
+    if (!faqChannel) {
+        return triggerMessage.reply('❌ Could not find the FAQ channel.');
+    }
+
+    const ACCENT = 0x5865F2; // Discord blurple
+    const lastUpdated = 'March 22, 2026';
+    const version = '2.4';
+    const supported = '1.21.11, 1.21.5, 1.21.1, 1.20.1 (Fabric, Forge, NeoForge)';
+
+    // 1 — Header
+    const headerEmbed = new EmbedBuilder()
+        .setColor(ACCENT)
+        .setTitle('📋 Punchy! Frequently Asked Questions')
+        .setDescription(
+            `**Last Update:** ${lastUpdated}  |  **Version:** ${version}\n` +
+            `**Supported Versions:** ${supported}`
+        );
+
+    // 2 — Older versions
+    const olderVersionsEmbed = new EmbedBuilder()
+        .setColor(ACCENT)
+        .setTitle('🚀 Will older versions (below 1.21.11) still get updates?')
+        .setDescription(
+            '**Yes!** We currently use **1.21.11** as our development base, ' +
+            'but we actively backport features to all older supported versions.'
+        );
+
+    // 3 — Configuration
+    const configEmbed = new EmbedBuilder()
+        .setColor(ACCENT)
+        .setTitle('⚙️ How do I configure the mod settings?')
+        .setDescription(
+            'Press **F8**, Punchy! 2.4 no longer needs dependencies for config.\n\n' +
+            'If you have a configuration UI mod installed you can also access settings via ' +
+            '**Mods › Punchy! › Config**:\n' +
+            '• **Fabric:** Install [Mod Menu](https://modrinth.com/mod/modmenu)\n' +
+            '• **Forge / NeoForge:** Install [Configured](https://www.curseforge.com/minecraft/mc-mods/configured)'
+        );
+
+    // 4 — Resource pack compatibility
+    const resourcePackEmbed = new EmbedBuilder()
+        .setColor(ACCENT)
+        .setTitle('🎨 My Resource Pack isn\'t working with the mod?')
+        .setDescription(
+            'We have added workarounds to ensure **most** resource packs work automatically, ' +
+            'but some issues may persist.\n\n' +
+            '**Dev fix:** Add explicit compatibility via our wiki → <https://github.com/punchy-mod/punchy-wiki>\n\n' +
+            'Press **F9** to access the brand-new **Item Positioner**, Arm Positioner and Profile Management.\n\n' +
+            '**Quick fix via Config:**\n' +
+            '• **Single item:** Add the specific ID (e.g. `examplemod:item_name`)\n' +
+            '• **Whole mod:** Add the mod ID (e.g. `examplemod`) to disable Punchy rendering for all its items\n' +
+            '*This reverts those items to standard vanilla rendering.*\n\n' +
+            `For questions about documentation or custom animations, ask in <#${WIKI_FORUM_ID}>.`
+        );
+
+    // 5 — Supported packs / addons
+    const packsEmbed = new EmbedBuilder()
+        .setColor(ACCENT)
+        .setTitle('📦 Where can I find supported packs?')
+        .setDescription(
+            '• **[Official Compatibility Collection](https://modrinth.com/collection/GypBAs4y)** — ' +
+            'A curated list of packs with explicit Punchy! support.\n' +
+            `• Check <#${ADDONS_CHANNEL_ID}> to find or share community-made packs.`
+        );
+
+    // 6 — Gallery
+    const galleryEmbed = new EmbedBuilder()
+        .setColor(ACCENT)
+        .setTitle('📷 Gallery')
+        .setDescription(
+            `Post your screenshots and videos in <#${GALLERY_CHANNEL_ID}>.\n` +
+            '> 💡 Use <https://catbox.moe/> to upload large files.'
+        );
+
+    // 7 — Roadmap
+    const roadmapEmbed = new EmbedBuilder()
+        .setColor(ACCENT)
+        .setTitle('🗺️ Development Roadmap')
+        .setDescription(`Want to see what's coming next? Check <#${ROADMAP_CHANNEL_ID}>.`);
+
+    // 8 — Support channels
+    const supportEmbed = new EmbedBuilder()
+        .setColor(ACCENT)
+        .setTitle('❓ Support Channels')
+        .setDescription(
+            `🐛 **Found a bug?** Report it in <#${SUPPORT_FORUM_ID}>\n` +
+            `💡 **Have an idea?** Post in <#${SUGGESTIONS_CHANNEL_ID}>\n` +
+            `📚 **Wiki questions?** Ask in <#${WIKI_FORUM_ID}>`
+        );
+
+    const embeds = [
+        headerEmbed,
+        olderVersionsEmbed,
+        configEmbed,
+        resourcePackEmbed,
+        packsEmbed,
+        galleryEmbed,
+        roadmapEmbed,
+        supportEmbed
+    ];
+
+    // Discord allows max 10 embeds per message; split into batches of 3 to keep it readable
+    for (let i = 0; i < embeds.length; i += 3) {
+        await faqChannel.send({ embeds: embeds.slice(i, i + 3) });
+    }
+
+    await triggerMessage.reply(`✅ Posted the 2.4 FAQ to <#${FAQ_CHANNEL_ID}>!`);
+    console.log(`📋 FAQ 2.4 posted to ${FAQ_CHANNEL_ID} by ${triggerMessage.author.username}`);
+}
 
 client.login(DISCORD_TOKEN);
