@@ -42,7 +42,7 @@ http.createServer((req, res) => {
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'MTQ2NTE2NTIzNzM1ODU1OTM4Ng.GzMjzR.O8YH-fJay2D-4NiVSBA0fnra4c4AlpHGpfK1FA'; 
 const CLIENT_ID = process.env.CLIENT_ID || '1465165237358559386'; 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyB-umYe0W2nl1y7jf_fZ-X2kmlfIuSbbc4';
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 /**
  * Determine if a task needs advanced thinking or can use flash response
@@ -94,11 +94,14 @@ function shouldUseThinking(content, hasLogFile = false, isDeepAnalysis = false) 
 }
 
 /**
- * Call Gemini with automatic retry on transient failures.
+ * Call Gemini 2.5 Flash with automatic retry on transient failures.
  * 4xx errors are never retried — they indicate a permanent problem.
+ *
+ * useThinking=false → thinkingBudget:0  (thinking disabled, fastest + cheapest)
+ * useThinking=true  → thinkingBudget:-1 (dynamic budget, model decides how much to think)
  */
 async function callGemini(prompt, useThinking = false) {
-    console.log(`🤖 Calling Gemini`);
+    console.log(`🤖 Calling Gemini 2.5 Flash (thinking: ${useThinking})`);
 
     let lastErr;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -108,13 +111,17 @@ async function callGemini(prompt, useThinking = false) {
                     contents: [{ parts: [{ text: prompt }] }],
                     generationConfig: {
                         temperature: 0.7,
-                        maxOutputTokens: 8192
+                        maxOutputTokens: 8192,
+                        thinkingConfig: {
+                            thinkingBudget: useThinking ? -1 : 0
+                        }
                     }
                 }, {
                     timeout: 120000,
                     maxContentLength: 100 * 1024 * 1024
                 });
 
+                // 2.5 Flash may return thought parts before the actual response — skip them
                 const parts = res.data.candidates[0].content.parts;
                 const responsePart = parts.slice().reverse().find(p => !p.thought && p.text) || parts[parts.length - 1];
                 return responsePart.text;
