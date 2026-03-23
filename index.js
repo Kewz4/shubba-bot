@@ -42,8 +42,7 @@ http.createServer((req, res) => {
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || 'MTQ2NTE2NTIzNzM1ODU1OTM4Ng.GzMjzR.O8YH-fJay2D-4NiVSBA0fnra4c4AlpHGpfK1FA'; 
 const CLIENT_ID = process.env.CLIENT_ID || '1465165237358559386'; 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyB-umYe0W2nl1y7jf_fZ-X2kmlfIuSbbc4';
-// Gemini 2.5 Flash — smarter reasoning, built-in thinking, very cost-effective
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
 
 /**
  * Determine if a task needs advanced thinking or can use flash response
@@ -95,12 +94,11 @@ function shouldUseThinking(content, hasLogFile = false, isDeepAnalysis = false) 
 }
 
 /**
- * Call Gemini 2.5 Flash with automatic retry on transient failures.
- * The useThinking parameter is accepted for compatibility but the model
- * handles reasoning internally — no separate thinking endpoint needed.
+ * Call Gemini with automatic retry on transient failures.
+ * 4xx errors are never retried — they indicate a permanent problem.
  */
 async function callGemini(prompt, useThinking = false) {
-    console.log(`🤖 Calling Gemini 2.5 Flash`);
+    console.log(`🤖 Calling Gemini`);
 
     let lastErr;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -117,15 +115,25 @@ async function callGemini(prompt, useThinking = false) {
                     maxContentLength: 100 * 1024 * 1024
                 });
 
-                // Grab the last non-thought text part (handles thinking-model response format)
                 const parts = res.data.candidates[0].content.parts;
                 const responsePart = parts.slice().reverse().find(p => !p.thought && p.text) || parts[parts.length - 1];
                 return responsePart.text;
             });
         } catch (err) {
             lastErr = err;
+            // Log the actual Google API error message for easier debugging
+            const apiMsg = err.response?.data?.error?.message || err.response?.data?.error || '';
+            if (apiMsg) console.error(`🔴 Gemini API error: ${apiMsg}`);
+
+            // Don't retry on client errors (bad request, auth, not found, etc.)
+            const status = err.response?.status;
+            if (status && status >= 400 && status < 500) {
+                console.error(`❌ Gemini returned ${status} — not retrying`);
+                throw err;
+            }
+
             if (attempt < 2) {
-                const delay = (attempt + 1) * 3000; // 3 s, 6 s
+                const delay = (attempt + 1) * 3000; // 3s, 6s
                 console.warn(`⚠️ Gemini attempt ${attempt + 1} failed (${err.message}), retrying in ${delay / 1000}s...`);
                 await new Promise(r => setTimeout(r, delay));
             }
@@ -1330,11 +1338,16 @@ async function studyEverything() {
         const allThreads = [...activeThreads.threads.values(), ...archivedThreads.threads.values()].slice(0, 15);
         
         let caseStudies = `\n--- CASE STUDIES: HOW PAST THREADS WERE HANDLED ---\n`;
-        for (const thread of allThreads) {
-            const messages = await thread.messages.fetch({ limit: 10 });
-            const chatLog = messages.reverse().map(m => `${m.author.username}: ${m.content.substring(0, 150)}`).join("\n");
-            caseStudies += `[Case: ${thread.name}]\nDialogue:\n${chatLog}\n\n`;
-        }
+        const caseResults = await Promise.all(allThreads.map(async (thread) => {
+            try {
+                const messages = await thread.messages.fetch({ limit: 10 });
+                const chatLog = messages.reverse().map(m => `${m.author.username}: ${m.content.substring(0, 150)}`).join("\n");
+                return `[Case: ${thread.name}]\nDialogue:\n${chatLog}\n\n`;
+            } catch (e) {
+                return `[Case: ${thread.name}]\n(Could not fetch messages)\n\n`;
+            }
+        }));
+        caseStudies += caseResults.join('');
         
         // Add case studies to EN-US cache
         if (DYNAMIC_KNOWLEDGE_CACHE['EN-US']) {
