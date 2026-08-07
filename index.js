@@ -1,7 +1,21 @@
 // Load secrets from a server-side .env file (kept out of the code + git).
 // Wrapped so a missing dotenv module never hard-crashes before the clear
 // "missing env var" message below; npm install fetches it on startup.
-try { require('dotenv').config(); } catch (_) { /* dotenv optional */ }
+// override:true — the SparkedHost panel has a stray masked GEMINI_API_KEY in the
+// process env; without override, dotenv keeps that bad value instead of the .env
+// one. Forcing override makes the .env file the single source of truth.
+try { require('dotenv').config({ override: true }); } catch (_) { /* dotenv optional */ }
+
+// Lightweight error logging to a file (readable via the panel / API), so
+// failures can be diagnosed without live console access. Additive only.
+function shubbaLogError(tag, err) {
+    try {
+        const line = `[${new Date().toISOString()}] ${tag}: ${(err && err.stack) || err}\n`;
+        require('fs').appendFileSync('shubba-error.log', line);
+    } catch (_) { /* never let logging throw */ }
+}
+process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); shubbaLogError('unhandledRejection', e); });
+process.on('uncaughtException',  (e) => { console.error('uncaughtException:', e);  shubbaLogError('uncaughtException', e); });
 
 /**
  * PUNCHY SUPPORT BOT 2.0 - "The Deep Learning Developer"
@@ -1039,6 +1053,10 @@ function getGeminiRunner() {
         process.exit(1);
     }
 })();
+
+// One-time startup fingerprint (safe: length + last 4 chars only) so a bad key
+// source can be confirmed via the log file without exposing the secret.
+shubbaLogError('startup-diag', `GEMINI key len=${GEMINI_API_KEY.length} tail=…${GEMINI_API_KEY.slice(-4)} | standard=${GEMINI_CHAIN_STANDARD[0]}`);
 
 // ── GROQ (alternative AI provider — set USE_GROQ=true to use) ─────────────
 // NOTE: Groq's free tier has a 12,000 TPM (tokens-per-minute) limit, which is
