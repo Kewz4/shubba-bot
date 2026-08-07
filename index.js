@@ -990,12 +990,16 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 //   GEMINI_CHAIN_WIKI="gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite"
 // Legacy single-model vars (GEMINI_MODEL_STANDARD / _WIKI) still work — they're
 // pinned to the FRONT of the chain for backward compatibility.
+// Defaults lead with gemini-3.6-flash (newest, smartest — verified working on
+// the project key) and fall back across separate free-quota buckets:
+// 3.6-flash → 3.5-flash → 2.5-flash → 2.5-flash-lite. Any model not enabled on
+// a given key is auto-dropped (404) at runtime, so this is safe to ship.
 const GEMINI_CHAIN_STANDARD = parseChain(
-    process.env.GEMINI_CHAIN_STANDARD || 'gemini-2.5-flash,gemini-2.5-flash-lite',
+    process.env.GEMINI_CHAIN_STANDARD || 'gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite',
     process.env.GEMINI_MODEL_STANDARD // legacy override → front of chain
 );
 const GEMINI_CHAIN_WIKI = parseChain(
-    process.env.GEMINI_CHAIN_WIKI || 'gemini-2.5-flash,gemini-2.5-flash-lite',
+    process.env.GEMINI_CHAIN_WIKI || 'gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite',
     process.env.GEMINI_MODEL_WIKI
 );
 // Back-compat: some older code paths still read these single names.
