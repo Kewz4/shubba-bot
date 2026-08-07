@@ -1,19 +1,20 @@
 {
-  "name": "punchy-bot",
-  "version": "2.0.0",
-  "description": "Support Bot for Punchy! Mod using Gemini AI",
+  "name": "shubba",
+  "version": "1.0.0",
+  "description": "Punchy! Minecraft mod support bot",
   "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node index.js",
     "test": "node --test test/*.test.js",
     "check": "node --check index.js"
   },
   "dependencies": {
-    "@google-cloud/storage": "^7.7.0",
-    "axios": "^1.19.0",
-    "discord.js": "^14.13.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "discord.js": "^14.16.3",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.5"
   }
 }

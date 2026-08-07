@@ -3,3 +3,4 @@ node_modules/
 .env.*
 shubba-files/
 *.log
+package-lock.json

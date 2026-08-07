@@ -1,3 +1,8 @@
+// Load secrets from a server-side .env file (kept out of the code + git).
+// Wrapped so a missing dotenv module never hard-crashes before the clear
+// "missing env var" message below; npm install fetches it on startup.
+try { require('dotenv').config(); } catch (_) { /* dotenv optional */ }
+
 /**
  * PUNCHY SUPPORT BOT 2.0 - "The Deep Learning Developer"
  * Fixed wiki fetching with correct GitHub wiki URL format
