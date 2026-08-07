@@ -1902,15 +1902,16 @@ DEV/OWNER KNOWLEDGE (share with owners kewz. and PunchyMan only — never with r
 OFFICIAL ADDONS
 ════════════════════════════════════════════════════════════
 
-PUNCHY! X TINY TAKEOVERS (punchy_puppies mod):
+PUNCHY! x TINY TAKEOVER (punchy_puppies mod):
   Modrinth: https://modrinth.com/mod/tiny-takeover-x-punchy
   Mod ID: punchy_puppies
-  Current version: 1.0.0
-  Supported: Minecraft 26.1 — Fabric ONLY (no Forge, no NeoForge)
-  Requires: Fabric Loader ≥0.18.4, Minecraft ≥26.1-alpha.11, Java ≥25, Fabric API
-  Made by: Punchy (official addon — not a third-party mod)
+  Current version: 2.0.1
+  Supported: Fabric, Forge AND NeoForge — MC 1.20.1, 1.21.1, 26.1.x, 26.2
+  Requires: Punchy! (hard dependency) + the loader's API (e.g. Fabric API on Fabric)
+  Made by: Punchy Guys Studios (official addon — not a third-party mod)
   License: ARR (All Rights Reserved)
-  Environment: Client-side only
+  Environment: has a SERVER-SIDE component (carry/fetch/whistle sync). On
+  multiplayer servers with anti-cheat it can trigger bans — warn users.
 
   WHAT IT DOES:
   This is an official Punchy! addon that adds first-person animations for tiny mob interactions.
@@ -1956,16 +1957,15 @@ PUNCHY! X TINY TAKEOVERS (punchy_puppies mod):
   - The inspect animation (inspect_baby_wolf) plays when the player inspects their carried mob
 
   VERSION SUPPORT:
-  - Currently 26.1 Fabric ONLY — no other MC versions or loaders are supported yet
-  - If a user asks about 1.21.x or Forge/NeoForge support: "The addon currently only supports Minecraft 26.1 on Fabric. Other versions aren't available yet."
+  - Ships Fabric, Forge AND NeoForge; supports MC 1.20.1, 1.21.1, 26.1.x and 26.2
+  - Forge 1.20.1 / NeoForge 1.21.1 startup crashes were fixed in Punchy 2.6.1 — update Punchy first if a user hits one
 
   COMMON ISSUES WITH THIS ADDON:
   - "Carried mob is invisible/floating": this is normal — the mob's world render is suppressed while carried, it only appears in your hand view
   - "Carry animations look wrong": likely a resource pack conflict — Punchy X Tiny Takeovers adds its own tuning, make sure it's loaded correctly
   - "Stick throw doesn't work": confirm you have the keybind set and are holding/have a stick; the wolf must be a baby tamed wolf you own
   - "Wolves won't respond to whistle": wolves must be YOUR owned baby wolves; wild wolves and adult wolves are not supported
-  - "Mod crashes on startup": confirm Fabric API is installed (Fabric) and they're on a supported MC version; Forge 1.20.1 / NeoForge 1.21.1 startup crashes were fixed in Punchy 2.6.1 — update Punchy first
-  - Tiny Takeover now ships Fabric, Forge AND NeoForge and supports 1.20.1, 1.21.1, 26.1.x and 26.2 (the old "Fabric only" note is outdated)
+  - "Mod crashes on startup": confirm the loader's API is installed (Fabric API on Fabric) and they're on a supported MC version; Forge 1.20.1 / NeoForge 1.21.1 startup crashes were fixed in Punchy 2.6.1 — update Punchy first
 ` + PUNCHY_VERIFIED_KNOWLEDGE;
 
 // GCS file for owner-taught custom knowledge entries
@@ -8272,6 +8272,10 @@ CURRENT MESSAGE: "${message.content}"
 KNOWLEDGE BASE (including DEV/OWNER sections — you may reference all of it here):
 ${freshKnowledge.substring(0, 160000)}
 
+VERIFIED PUNCHY KNOWLEDGE (authoritative — official addon/mod roster, config, keybinds, known issues):
+${PUNCHY_STATIC_KNOWLEDGE}
+${buildCustomKnowledge()}
+
 Instructions:
 - Be helpful, direct, and technical — this is a dev channel
 - You can discuss internals, architecture, and implementation details freely here
@@ -8627,6 +8631,10 @@ DEVELOPER'S MESSAGE: ${message.content}
 ${conversationContext}
 
 ${devModeInstructions}
+
+VERIFIED PUNCHY KNOWLEDGE (authoritative — use this for any facts about the mod, its OFFICIAL addons/roster, config, and keybinds; the roster of official Punchy Guys Studios projects is listed here):
+${PUNCHY_STATIC_KNOWLEDGE}
+${buildCustomKnowledge()}
 
 Instructions:
 - Be casual, direct, and helpful — you're talking to a dev, not a user

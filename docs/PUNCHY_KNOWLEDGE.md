@@ -36,5 +36,23 @@ exported string, easy to edit, and requires no other code changes. The live laye
 automatically, so only durable facts (new config keys, changed keybinds, new
 companion mods) need a manual edit here.
 
-Canonical sources: `wiki.punchymod.com` · Modrinth `punchy-fpa` ·
-Discord `discord.gg/CXttaCyGCN` (also the official bug tracker).
+## Official roster (keep this correct)
+
+Punchy Guys Studios (Modrinth org `punchy-guys-studios`, id `Vsap1kyd`; public
+devs PunchyDevGuy (owner) and Godku) ships **exactly 5** official projects:
+
+1. **Punchy!** — core mod (`punchy-fpa`)
+2. **Punchy! x Tiny Takeover** — mod, hard-depends on Punchy!, has a server-side
+   component (`tiny-takeover-x-punchy`)
+3. **Punchy! - Shuba Totem** — resource pack (`punchy-shuba-totem`)
+4. **Enchanted Fishing Line** — mod, client-side, no hard Punchy dep but still
+   official (`enchanted-fishing-line`)
+5. **Better Fishing** — mod, MC 1.21.1 + 26.2 only (`better-fishing-system`)
+
+Everything else with "punchy" in the name (Hyper Punchy, Refined Torches, etc.,
+collection `GypBAs4y`) is **community**, not official. When "what are the Punchy
+Guys mods?" is asked, all five must be listed.
+
+Canonical sources: `wiki.punchymod.com` · Modrinth org
+`punchy-guys-studios` · Modrinth `punchy-fpa` · Discord `discord.gg/CXttaCyGCN`
+(also the official bug tracker).
