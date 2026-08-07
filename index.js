@@ -38,6 +38,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const { createGeminiRunner, parseChain } = require('./lib/gemini-chain');
+const { PUNCHY_VERIFIED_KNOWLEDGE } = require('./lib/punchy-knowledge');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LOCAL FILESYSTEM STORAGE SHIM
@@ -1936,9 +1937,9 @@ PUNCHY! X TINY TAKEOVERS (punchy_puppies mod):
   - "Carry animations look wrong": likely a resource pack conflict — Punchy X Tiny Takeovers adds its own tuning, make sure it's loaded correctly
   - "Stick throw doesn't work": confirm you have the keybind set and are holding/have a stick; the wolf must be a baby tamed wolf you own
   - "Wolves won't respond to whistle": wolves must be YOUR owned baby wolves; wild wolves and adult wolves are not supported
-  - "Mod crashes on startup": confirm you're on 26.1 Fabric with Fabric API installed; this mod does NOT support other versions
-  - If someone reports a bug with this addon and they're NOT on 26.1 Fabric, tell them it's not supported on their version/loader before anything else
-`;
+  - "Mod crashes on startup": confirm Fabric API is installed (Fabric) and they're on a supported MC version; Forge 1.20.1 / NeoForge 1.21.1 startup crashes were fixed in Punchy 2.6.1 — update Punchy first
+  - Tiny Takeover now ships Fabric, Forge AND NeoForge and supports 1.20.1, 1.21.1, 26.1.x and 26.2 (the old "Fabric only" note is outdated)
+` + PUNCHY_VERIFIED_KNOWLEDGE;
 
 // GCS file for owner-taught custom knowledge entries
 const CUSTOM_KNOWLEDGE_FILE_NAME = 'custom_knowledge.json';
