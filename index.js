@@ -4640,8 +4640,26 @@ async function handleDismissDuplicate(interaction, newThreadId) {
 //   see a different message each time.
 //
 // Layer 2 — Behavioral rapid multi-channel spam detection
-//   Watches ALL messages. If any user posts to 4+ unique channels
-//   within 8 seconds → automatic kick. Works on accounts of any age.
+//   Watches ALL messages. Two tripwires, evaluated on a 5-second
+//   sliding window of the user's recent activity:
+//     A. 3+ distinct LOCATIONS *and* 3+ messages within 5s
+//     B. 3+ attachments across 2+ LOCATIONS (2+ messages) within 3s
+//   Either one → automatic kick. Works on accounts of any age.
+//
+//   "Location" = the parent forum/text channel. Thread IDs collapse to
+//   their parent, so opening a thread is NOT a second location.
+//
+//   Counting: one user action is observed by up to three gateway paths
+//   (the raw MESSAGE_CREATE listener, the MessageCreate handler, and
+//   ThreadCreate). All three funnel through recordActivity(), which
+//   dedupes on the message/thread ID so each action is counted EXACTLY
+//   ONCE. Without that, two real messages looked like four and tripped
+//   the 3-message clause that exists to prevent exactly that.
+//
+//   Staff (Moderator / Helper / Helper | Bug Hunter) and devs are exempt —
+//   they answer questions across several channels fast enough to look
+//   like a bot. If role membership cannot be resolved, this system FAILS
+//   SAFE and does not kick.
 // ============================================================
 
 // Rotating warning hints — varied wording, different lengths, different tones
@@ -4657,8 +4675,167 @@ const FLYTRAP_HINTS = [
     `🪤 **This is a honeypot channel.** Sending any message here causes an automatic ban. This applies to spam bots AND to real members who think they're being funny. The system cannot tell the difference — and neither does the moderation team.`,
 ];
 
-// Tracks recent messages per user: userId → [{ channelId, timestamp, threadId? }]
+// Tracks recent messages per user: userId → [{ channelId, locationId, threadId, dedupeKey, timestamp, ... }]
+// SINGLE shared store. Written to ONLY through recordActivity() below, which
+// dedupes — never push into this directly.
 const recentMessageActivity = new Map();
+
+// Roles that are never auto-moderated. Staff answer questions rapidly across
+// #general-en / #bug-report / #wiki-questions and are the members MOST likely
+// to trip a 3-locations-in-5s tripwire.
+const HELPER_ROLE_ID = '1512896900465164328';             // Helper
+const HELPER_BUG_HUNTER_ROLE_ID = '1450232834701787209';  // Helper | Bug Hunter
+const AUTOMOD_EXEMPT_ROLE_IDS = [
+    MOD_ROLE_ID,                 // Moderator (declared with the other role IDs above)
+    HELPER_ROLE_ID,
+    HELPER_BUG_HUNTER_ROLE_ID,
+];
+
+// ─── SPAM TRIPWIRE CORE ─────────────────────────── TESTABLE-BLOCK-START ────
+// Everything between the TESTABLE-BLOCK markers is pure: no discord.js objects,
+// no module-level state, no I/O. The store and clock are parameters. test/
+// anti-spam.test.js extracts this exact source range and evaluates it, so the
+// tests exercise the shipped logic rather than a copy of it.
+
+const SPAM_HISTORY_WINDOW_MS = 5000;      // Tripwire A window
+const SPAM_ATTACHMENT_WINDOW_MS = 3000;   // Tripwire B window
+const SPAM_MIN_LOCATIONS = 3;             // Tripwire A: distinct locations
+const SPAM_MIN_MESSAGES = 3;              // Tripwire A: total messages
+const SPAM_ATTACH_MIN_TOTAL = 3;          // Tripwire B: attachments
+const SPAM_ATTACH_MIN_LOCATIONS = 2;      // Tripwire B: distinct locations
+const SPAM_ATTACH_MIN_MESSAGES = 2;       // Tripwire B: total messages
+
+/**
+ * Record ONE user action in the sliding window, exactly once.
+ *
+ * Discord surfaces a single user action to us over as many as three paths:
+ *   1. the raw MESSAGE_CREATE gateway listener (fastest — wins the race),
+ *   2. the MessageCreate handler (via checkBehavioralSpam),
+ *   3. ThreadCreate (for forum/thread posts).
+ * A thread's starter message carries a message ID equal to the thread ID, so
+ * all three describe the same action under the same `dedupeKey`. The second and
+ * third sightings must NOT add another entry — that inflation is what defeated
+ * the 3-message safety clause on Tripwire A.
+ *
+ * @returns {{history: Array, deduped: boolean}} `deduped: true` means this
+ *          action was already recorded; the caller must not re-evaluate.
+ */
+function recordActivity(store, uid, entry, now) {
+    const history = (store.get(uid) || []).filter(m => now - m.timestamp < SPAM_HISTORY_WINDOW_MS);
+
+    const existing = entry.dedupeKey != null
+        ? history.find(m => m.dedupeKey != null && m.dedupeKey === entry.dedupeKey)
+        : null;
+
+    if (existing) {
+        // Same action, second observer. Don't count it again — but do let a path
+        // that knows more about the action improve the stored record. ThreadCreate
+        // knows the authoritative parentId; the raw path may only have seen an
+        // uncached thread and been unable to resolve a parent.
+        if (entry.locationKnown && !existing.locationKnown) {
+            existing.locationId = entry.locationId;
+            existing.locationKnown = true;
+        }
+        if (existing.threadId == null && entry.threadId != null) existing.threadId = entry.threadId;
+        if ((entry.attachments || 0) > (existing.attachments || 0)) existing.attachments = entry.attachments;
+        store.set(uid, history);
+        return { history, deduped: true };
+    }
+
+    history.push(entry);
+    store.set(uid, history);
+    return { history, deduped: false };
+}
+
+/**
+ * Evaluate both tripwires against a recorded window.
+ *
+ * Entries whose location could not be resolved (`locationKnown === false` — an
+ * uncached thread whose parent we don't know) still count toward the message
+ * totals but do NOT contribute a distinct location. Counting an unresolved
+ * thread as its own location is what would make three posts in ONE forum look
+ * like three separate locations, so we stay conservative: an unknown location
+ * can never be the thing that pushes a member over a threshold.
+ *
+ * @returns {null | {kind: string, reason: string, hist: Array}}
+ */
+function evaluateTripwires(history, now) {
+    const located = history.filter(m => m.locationKnown !== false);
+
+    // ── Tripwire A: 3+ locations AND 3+ messages in 5s ──────────────────────
+    // Both clauses required. The message clause is the guard against a single
+    // action being seen on more than one gateway path; it only works because
+    // recordActivity() has already collapsed those duplicates.
+    const uniqueLocations = new Set(located.map(m => m.locationId));
+    if (uniqueLocations.size >= SPAM_MIN_LOCATIONS && history.length >= SPAM_MIN_MESSAGES) {
+        return {
+            kind: 'multi-channel',
+            reason: `Rapid multi-channel spam: ${uniqueLocations.size} channels, ${history.length} messages in <${SPAM_HISTORY_WINDOW_MS / 1000}s`,
+            hist: history,
+        };
+    }
+
+    // ── Tripwire B: 3+ attachments across 2+ locations in 3s ────────────────
+    const within = history.filter(m => now - m.timestamp < SPAM_ATTACHMENT_WINDOW_MS);
+    const withinLocated = within.filter(m => m.locationKnown !== false);
+    const totalAttachments = within.reduce((sum, m) => sum + (m.attachments || 0), 0);
+    const attachmentLocations = new Set(withinLocated.filter(m => m.attachments > 0).map(m => m.locationId));
+    if (totalAttachments >= SPAM_ATTACH_MIN_TOTAL &&
+        attachmentLocations.size >= SPAM_ATTACH_MIN_LOCATIONS &&
+        within.length >= SPAM_ATTACH_MIN_MESSAGES) {
+        return {
+            kind: 'attachment-flood',
+            reason: `Attachment spam: ${totalAttachments} attachments across ${attachmentLocations.size} channels in ${SPAM_ATTACHMENT_WINDOW_MS / 1000}s`,
+            hist: within,
+        };
+    }
+
+    return null;
+}
+
+/**
+ * Decide what auto-moderation may do to a user.
+ *
+ *   'exempt'       → bot, dev, or staff. Take no action at all.
+ *   'cleanup-only' → roles could NOT be determined. FAIL SAFE: never kick;
+ *                    clean the spam up and let a human decide.
+ *   'kick'         → confirmed non-staff member. Kick is authorised.
+ *
+ * `deps` exists so tests can drive this without a live guild.
+ */
+async function resolveAutoModVerdict(guild, user, deps = {}) {
+    const devIds = deps.devIds || DEV_IDS;
+    const exemptRoleIds = deps.exemptRoleIds || AUTOMOD_EXEMPT_ROLE_IDS;
+
+    if (!user || !user.id) return 'exempt';
+    if (user.bot) return 'exempt';
+    if (devIds.includes(user.id)) return 'exempt';
+
+    if (!guild || !guild.members) return 'cleanup-only';   // FAIL SAFE
+
+    // Cache first — the GuildMembers intent is enabled, so staff are essentially
+    // always cached and this costs nothing on the fast kick path.
+    let member = null;
+    try { member = guild.members.cache?.get(user.id) || null; } catch (e) { member = null; }
+
+    // Cache miss: one REST lookup. The user may have left the guild, the fetch
+    // may time out, or the bot may lack permission — all resolve to null, and
+    // null means "unknown roles", which must never escalate to a kick.
+    if (!member) {
+        try { member = await guild.members.fetch(user.id); } catch (e) { member = null; }
+    }
+    if (!member) return 'cleanup-only';                     // FAIL SAFE
+    if (member.user?.bot) return 'exempt';
+
+    const roleCache = member.roles?.cache;
+    if (!roleCache || typeof roleCache.has !== 'function') return 'cleanup-only';  // FAIL SAFE
+
+    for (const roleId of exemptRoleIds) {
+        if (roleId && roleCache.has(roleId)) return 'exempt';
+    }
+    return 'kick';
+}
+// ─── SPAM TRIPWIRE CORE ───────────────────────────── TESTABLE-BLOCK-END ────
 
 // "Snapped out of existence" counter — persisted to GCS, starting at 15
 let snappedCount = 15;
@@ -4698,7 +4875,16 @@ setInterval(() => {
  * The snapped counter is appended to the next hint rotation in the flytrap channel.
  */
 async function executeSpamAction(guild, user, reason, triggerMessage = null) {
-    if (!user || user.bot || DEV_IDS.includes(user.id)) return;
+    if (!user || !user.id || user.bot || DEV_IDS.includes(user.id)) return;
+
+    // Staff / dev / unresolvable-roles gate. 'cleanup-only' still deletes the
+    // offending message but never kicks.
+    const verdict = await resolveAutoModVerdict(guild, user);
+    if (verdict === 'exempt') {
+        console.log(`🛡️ Flytrap skipped for ${user.username} (${user.id}) — exempt (staff/dev/bot)`);
+        return;
+    }
+
     console.log(`🪤 FLYTRAP: ${user.username} (${user.id}) — ${reason}`);
     try {
         let msgContent = '';
@@ -4714,9 +4900,14 @@ async function executeSpamAction(guild, user, reason, triggerMessage = null) {
             await triggerMessage.delete().catch(() => {});
         }
 
-        // Soft ban: kick + delete recent messages
-        const member = await guild.members.fetch(user.id).catch(() => null);
-        if (member) await member.kick(`[Shubba Flytrap] ${reason}`);
+        // Soft ban: kick + delete recent messages.
+        // Only when roles were positively resolved to a non-staff member.
+        if (verdict === 'kick') {
+            const member = await guild.members.fetch(user.id).catch(() => null);
+            if (member) await member.kick(`[Shubba Flytrap] ${reason}`);
+        } else {
+            console.warn(`⚠️ Flytrap: roles unresolved for ${user.username} (${user.id}) — FAIL SAFE, no kick`);
+        }
 
         // Increment snapped counter
         snappedCount++; saveSnappedCount().catch(()=>{});
@@ -4753,9 +4944,29 @@ async function executeSpamAction(guild, user, reason, triggerMessage = null) {
 const _activeKicks = new Set();
 
 async function executeSoftBan(guild, user, reason, triggerMessage = null, spamChannelIds = [], spamThreadIds = [], deepScan = false) {
-    if (!user || user.bot || DEV_IDS.includes(user.id)) return;
+    if (!user || !user.id || user.bot || DEV_IDS.includes(user.id)) return;
     if (_activeKicks.has(user.id)) return; // already kicking
     _activeKicks.add(user.id);
+
+    // Everything below runs inside try/finally so the _activeKicks guard is
+    // always released. Without it, a throw anywhere in this function would pin
+    // the user in the set forever and silently disable moderation for them.
+    try {
+        await _executeSoftBanInner(guild, user, reason, triggerMessage, spamChannelIds, spamThreadIds, deepScan);
+    } finally {
+        _activeKicks.delete(user.id);
+    }
+}
+
+async function _executeSoftBanInner(guild, user, reason, triggerMessage, spamChannelIds, spamThreadIds, deepScan) {
+    // Staff / dev / unresolvable-roles gate — the single chokepoint every
+    // behavioral tripwire funnels through.
+    const verdict = await resolveAutoModVerdict(guild, user);
+    if (verdict === 'exempt') {
+        console.log(`🛡️ Anti-spam skipped for ${user.username} (${user.id}) — exempt (staff/dev/bot)`);
+        recentMessageActivity.delete(user.id);
+        return;
+    }
 
     const startMs = Date.now();
     console.log(`🚨 ANTI-SPAM: ${user.username} (${user.id}) — ${reason}${deepScan ? ' [deep scan]' : ''}`);
@@ -4791,17 +5002,24 @@ async function executeSoftBan(guild, user, reason, triggerMessage = null, spamCh
     // This is critical for shutting down active spam in <1s after detection.
     let kicked = false;
     let kickError = null;
-    try {
-        // guild.members.kick(userId, reason) is the fastest API surface. It does
-        // NOT fetch the member first — it goes straight to the REST kick endpoint
-        // with the user ID. Saves a 50-300ms member lookup roundtrip vs the
-        // member.kick() pattern.
-        await guild.members.kick(user.id, `[Shubba Anti-Spam] ${reason}`);
-        kicked = true;
-        console.log(`👢 Kicked ${user.username} in ${Date.now() - startMs}ms`);
-    } catch(e) {
-        kickError = e.message;
-        console.error(`❌ Kick failed for ${user.username}: ${e.message}`);
+    if (verdict === 'kick') {
+        try {
+            // guild.members.kick(userId, reason) is the fastest API surface. It does
+            // NOT fetch the member first — it goes straight to the REST kick endpoint
+            // with the user ID. Saves a 50-300ms member lookup roundtrip vs the
+            // member.kick() pattern.
+            await guild.members.kick(user.id, `[Shubba Anti-Spam] ${reason}`);
+            kicked = true;
+            console.log(`👢 Kicked ${user.username} in ${Date.now() - startMs}ms`);
+        } catch(e) {
+            kickError = e.message;
+            console.error(`❌ Kick failed for ${user.username}: ${e.message}`);
+        }
+    } else {
+        // verdict === 'cleanup-only': we could not confirm the user is not staff.
+        // FAIL SAFE — clean up the spam, alert the dev channel, kick nobody.
+        kickError = 'roles unresolved — fail-safe, no kick (needs manual review)';
+        console.warn(`⚠️ Anti-spam FAIL SAFE for ${user.username} (${user.id}): could not resolve roles, not kicking`);
     }
 
     // ── PARALLEL CLEANUP (happens after kick, user can't react) ──────────────
@@ -4894,8 +5112,6 @@ async function executeSoftBan(guild, user, reason, triggerMessage = null, spamCh
             await devChannel.send({ embeds: [embed] });
         }
     } catch(e) {}
-
-    _activeKicks.delete(user.id);
 }
 
 /**
@@ -4919,7 +5135,7 @@ async function handleFlyTrapTrigger(message) {
 }
 
 /**
- * Layer 2 — Rapid multi-channel spam detection.
+ * Layer 2 — Rapid multi-channel spam detection (MessageCreate path).
  *
  * Key insight: Discord fires MessageCreate for the thread starter message,
  * which has a different channelId than the parent forum. If we naively count
@@ -4929,15 +5145,18 @@ async function handleFlyTrapTrigger(message) {
  * Fix: normalize thread channelIds to their parent. A thread and its parent
  * count as the SAME location for spam purposes.
  *
- * Tripwires (both require multi-channel AND multi-message — no single thread
- * post or single-channel hype chat can trip these):
- *   A. 3+ distinct LOCATIONS in 5s with at least 3 messages total
- *   B. 3+ attachments across 2+ LOCATIONS in 3s
+ * This is the SLOW path and is normally a no-op. The raw gateway listener sees
+ * the same MESSAGE_CREATE ~10-20ms earlier and records it first, so by the time
+ * this runs, recordActivity() reports `deduped` and we return without counting
+ * or re-evaluating anything. It stays wired up as a fallback for the case where
+ * the raw packet was missed (or the raw listener is not installed), which keeps
+ * detection working without ever double-counting.
  *
- * "Location" = parent forum/text channel (thread IDs collapse to parents).
+ * Thresholds live in evaluateTripwires() — see the SPAM TRIPWIRE CORE block.
  */
 async function checkBehavioralSpam(message) {
-    if (message.author.bot || DEV_IDS.includes(message.author.id) || !message.guild) return;
+    if (!message?.author || message.author.bot || !message.guild) return;
+    if (DEV_IDS.includes(message.author.id)) return;
     if (_activeKicks.has(message.author.id)) return;
     const uid = message.author.id;
     const now = Date.now();
@@ -4945,46 +5164,30 @@ async function checkBehavioralSpam(message) {
     // Normalize: if this message is in a thread, use the parent channel ID as
     // the "location" so opening a thread doesn't count as a new channel.
     const channel = message.channel;
-    const isThread = channel?.isThread && channel.isThread();
+    const isThread = !!(channel?.isThread && channel.isThread());
     const locationId = isThread ? (channel.parentId || channel.id) : message.channelId;
 
-    const HISTORY_WINDOW_MS = 5000;
-    const history = (recentMessageActivity.get(uid) || []).filter(m => now - m.timestamp < HISTORY_WINDOW_MS);
-    history.push({
-        channelId: message.channelId,           // exact channel — used for message deletion later
+    const { history, deduped } = recordActivity(recentMessageActivity, uid, {
+        dedupeKey: message.id,                   // same key the raw path uses
+        channelId: message.channelId,            // exact channel — used for message deletion later
         locationId,                              // normalized — used for spam threshold counting
+        locationKnown: !isThread || !!channel.parentId,
         threadId: isThread ? channel.id : null,
         messageId: message.id,
         attachments: message.attachments?.size || 0,
         timestamp: now,
-    });
-    recentMessageActivity.set(uid, history);
+    }, now);
 
-    // ── Tripwire A: 3+ locations AND 3+ messages in 5s ──────────────────────
-    // Both conditions required. A single thread create produces 1 message but
-    // possibly 2 channel events — the AND-3-messages clause prevents that.
-    const uniqueLocations = new Set(history.map(m => m.locationId));
-    if (uniqueLocations.size >= 3 && history.length >= 3) {
-        return _trigger(message, 'multi-channel',
-            `Rapid multi-channel spam: ${uniqueLocations.size} channels, ${history.length} messages in <5s`,
-            history);
-    }
+    // Already seen on a faster path — counting or judging it again would act on
+    // the same evidence twice.
+    if (deduped) return;
 
-    // ── Tripwire B: 3+ attachments across 2+ locations in 3s ────────────────
-    // Attachment spam pattern: dropping screenshots+links in multiple channels.
-    const within3s = history.filter(m => now - m.timestamp < 3000);
-    const totalAttachments3s = within3s.reduce((sum, m) => sum + (m.attachments || 0), 0);
-    const locationsWithAttachments3s = new Set(within3s.filter(m => m.attachments > 0).map(m => m.locationId));
-    if (totalAttachments3s >= 3 && locationsWithAttachments3s.size >= 2 && within3s.length >= 2) {
-        return _trigger(message, 'attachment-flood',
-            `Attachment spam: ${totalAttachments3s} attachments across ${locationsWithAttachments3s.size} channels in 3s`,
-            within3s);
-    }
+    const verdict = evaluateTripwires(history, now);
+    if (verdict) return _trigger(message, verdict.kind, verdict.reason, verdict.hist);
 }
 
 async function _trigger(message, kind, reason, relevantHistory) {
-    const uid = message.author.id;
-    const spamChannelIds = Array.from(new Set(relevantHistory.map(m => m.channelId)));
+    const spamChannelIds = Array.from(new Set(relevantHistory.map(m => m.channelId).filter(Boolean)));
     const spamThreadIds = relevantHistory.map(m => m.threadId).filter(Boolean);
     console.log(`🪤 [${kind}] ${message.author.username}: ${reason}`);
 
@@ -7557,53 +7760,62 @@ process.on('unhandledRejection', (error) => {
 // kick/cleanup still goes through executeSoftBan (which needs proper objects).
 // We construct a minimal stub message object that gives executeSoftBan what it
 // needs without waiting for discord.js's full event resolution.
+// This is the PRIMARY recorder for messages. It runs first, so it is the path
+// that normally counts a message and fires the tripwire. checkBehavioralSpam()
+// and ThreadCreate record the same actions through the same recordActivity()
+// helper, which dedupes on message/thread ID — so whichever path observes an
+// action first counts it, and the others become no-ops.
 client.on('raw', (packet) => {
     if (packet.t !== 'MESSAGE_CREATE') return;
     const d = packet.d;
     if (!d || !d.guild_id) return;
     if (d.webhook_id) return;
     if (d.author?.bot) return;
-    if (DEV_IDS.includes(d.author?.id)) return;
+    if (!d.author?.id) return;
+    if (DEV_IDS.includes(d.author.id)) return;
     if (_activeKicks.has(d.author.id)) return;
 
     const uid = d.author.id;
     const now = Date.now();
-    const HISTORY_WINDOW_MS = 5000;
 
     // Normalize thread → parent so opening a forum thread doesn't count as
     // a different "channel" than the parent forum. We look the channel up in
     // the cache; if it's a thread, use its parent ID as the location.
     let locationId = d.channel_id;
+    let locationKnown = true;
+    let threadId = null;
     const cachedCh = client.channels.cache.get(d.channel_id);
-    if (cachedCh?.isThread && cachedCh.isThread() && cachedCh.parentId) {
-        locationId = cachedCh.parentId;
+    if (cachedCh?.isThread && cachedCh.isThread()) {
+        threadId = d.channel_id;
+        if (cachedCh.parentId) locationId = cachedCh.parentId;
+        else locationKnown = false;      // thread with no known parent
+    } else if (!cachedCh && d.id === d.channel_id) {
+        // A thread starter message: Discord gives it a message ID equal to the
+        // thread ID. The thread isn't in cache yet, so we cannot resolve its
+        // parent forum here. Record it, but flag the location as unknown rather
+        // than treating the thread as a location of its own — otherwise three
+        // posts in ONE forum would look like three separate locations. The
+        // ThreadCreate handler records the same action (same ID) with the real
+        // parentId and fixes the location up.
+        threadId = d.channel_id;
+        locationKnown = false;
     }
 
-    const history = (recentMessageActivity.get(uid) || []).filter(m => now - m.timestamp < HISTORY_WINDOW_MS);
-    history.push({
+    const { history, deduped } = recordActivity(recentMessageActivity, uid, {
+        dedupeKey: d.id,
         channelId: d.channel_id,
         locationId,
-        threadId: (cachedCh?.isThread && cachedCh.isThread()) ? d.channel_id : null,
+        locationKnown,
+        threadId,
         messageId: d.id,
         attachments: (d.attachments || []).length,
         timestamp: now,
-    });
-    recentMessageActivity.set(uid, history);
+    }, now);
 
-    // ── Tripwire A: 3+ locations AND 3+ messages in 5s ──────────────────────
-    const uniqueLocations = new Set(history.map(m => m.locationId));
-    if (uniqueLocations.size >= 3 && history.length >= 3) {
-        _rawTrigger(d, `Rapid multi-channel spam: ${uniqueLocations.size} channels, ${history.length} messages in <5s`, history);
-        return;
-    }
+    if (deduped) return;   // already counted by ThreadCreate — do not judge twice
 
-    // ── Tripwire B: 3+ attachments across 2+ locations in 3s ────────────────
-    const within3s = history.filter(m => now - m.timestamp < 3000);
-    const totalAttachments3s = within3s.reduce((sum, m) => sum + (m.attachments || 0), 0);
-    const locationsWithAttachments3s = new Set(within3s.filter(m => m.attachments > 0).map(m => m.locationId));
-    if (totalAttachments3s >= 3 && locationsWithAttachments3s.size >= 2 && within3s.length >= 2) {
-        _rawTrigger(d, `Attachment spam: ${totalAttachments3s} attachments across ${locationsWithAttachments3s.size} channels in 3s`, within3s);
-    }
+    const verdict = evaluateTripwires(history, now);
+    if (verdict) _rawTrigger(d, verdict.reason, verdict.hist);
 });
 
 function _rawTrigger(d, reason, relevantHistory) {
@@ -7630,7 +7842,7 @@ function _rawTrigger(d, reason, relevantHistory) {
         },
     };
 
-    const spamChannelIds = Array.from(new Set(relevantHistory.map(m => m.channelId)));
+    const spamChannelIds = Array.from(new Set(relevantHistory.map(m => m.channelId).filter(Boolean)));
     const spamThreadIds = relevantHistory.map(m => m.threadId).filter(Boolean);
 
     console.log(`🪤 [RAW] ${userStub.username}: ${reason}`);
@@ -7749,53 +7961,53 @@ client.on(Events.ThreadCreate, async (thread) => {
   // Scammers now create posts in forums in addition to sending messages.
   // Count each new thread creation as activity in its parent channel so the
   // behavioral spam detector can catch rapid multi-forum posting patterns.
+  //
+  // A forum post is ALSO delivered as a MESSAGE_CREATE (the starter message,
+  // whose message ID equals the thread ID), so the raw listener describes this
+  // same action. Both go through recordActivity() under that shared ID and the
+  // action is counted exactly once. This handler records SYNCHRONOUSLY, before
+  // any await, so it wins the race — which matters because only this path knows
+  // the authoritative parentId. The raw path would otherwise have to guess the
+  // location of a thread that isn't in cache yet.
+  //
+  // Thresholds are the shared ones in evaluateTripwires(); creating 3 forum
+  // threads in 5s is 3 locations and 3 recorded actions, so rapid forum spam
+  // still trips Tripwire A exactly as before.
   if (!thread.guild) return;
-  const ownerId = thread.ownerId;
-  if (ownerId && !DEV_IDS.includes(ownerId)) {
+  if (thread.ownerId && !DEV_IDS.includes(thread.ownerId)) {
     try {
-      const owner = await thread.guild.members.fetch(ownerId).catch(() => null);
-      // Skip bots and server staff
-      if (owner && !owner.user.bot) {
-        const uid = ownerId;
-        const now = Date.now();
-        const HISTORY_WINDOW_MS = 8000;
+      const uid = thread.ownerId;
+      const now = Date.now();
 
-        const history = (recentMessageActivity.get(uid) || []).filter(m => now - m.timestamp < HISTORY_WINDOW_MS);
-        // Record the parent forum channel + the new thread ID so it can be deleted if spam.
-        // CRITICAL: do NOT fetch the starter message here — that's a REST call that
-        // adds 150-400ms before we can trip the spam tripwire. Since both forum
-        // tripwires are based on channel count (not attachments — attachments-only
-        // logic was redundant because creating 3 threads is itself a 3-channel
-        // pattern), we can evaluate purely on metadata that's already in memory.
-        history.push({
-            channelId: thread.parentId,
-            threadId: thread.id,
-            messageId: null,
-            attachments: 0, // unknown at this point, doesn't matter for forum-spam tripwires
-            timestamp: now,
-        });
-        recentMessageActivity.set(uid, history);
+      // Record the parent forum channel + the new thread ID so it can be deleted
+      // if this turns out to be spam. CRITICAL: do NOT fetch the starter message
+      // here — that's a REST call that adds 150-400ms before we can trip the
+      // tripwire. Everything used below is already in memory.
+      const { history, deduped } = recordActivity(recentMessageActivity, uid, {
+          dedupeKey: thread.id,            // == the starter message's ID
+          channelId: thread.parentId || thread.id,
+          locationId: thread.parentId || thread.id,
+          locationKnown: !!thread.parentId,
+          threadId: thread.id,
+          messageId: thread.id,
+          attachments: 0,                  // unknown here; irrelevant to the forum tripwire
+          timestamp: now,
+      }, now);
 
-        // ── Single tripwire: 3+ forum thread creates in 5s ───────────────────
-        // Bumped back up after false positives — humans legitimately create
-        // forum threads back-to-back (asking in two help forums, etc.). Bots
-        // doing real spam hit many more than 2.
-        const within5s = history.filter(m => now - m.timestamp < 5000);
-        const uniqueChannels5s = new Set(within5s.map(m => m.channelId));
-
-        let triggered = null;
-        if (uniqueChannels5s.size >= 3) {
-            triggered = { reason: `Rapid forum spam: posts in ${uniqueChannels5s.size} forums in <5s`, hist: within5s };
-        }
-
-        if (triggered) {
-          const spamChannelIds = Array.from(new Set(triggered.hist.map(m => m.channelId)));
-          const spamThreadIds = triggered.hist.map(m => m.threadId).filter(Boolean);
-          console.log(`🚨 Forum spam detected: ${owner.user.username}: ${triggered.reason}`);
+      const verdict = (deduped || _activeKicks.has(uid)) ? null : evaluateTripwires(history, now);
+      if (verdict) {
+        // Only now pay for the member lookup — off the detection hot path.
+        const owner = await thread.guild.members.fetch(uid).catch(() => null);
+        // executeSoftBan re-checks staff roles and fails safe on its own; this is
+        // just to get a user object and skip obvious bots.
+        if (owner && !owner.user.bot) {
+          const spamChannelIds = Array.from(new Set(verdict.hist.map(m => m.channelId).filter(Boolean)));
+          const spamThreadIds = verdict.hist.map(m => m.threadId).filter(Boolean);
+          console.log(`🚨 Forum spam detected: ${owner.user.username}: ${verdict.reason}`);
           // Don't clear activity here — executeSoftBan reads it then clears.
           await executeSoftBan(
             thread.guild, owner.user,
-            triggered.reason,
+            verdict.reason,
             null,
             spamChannelIds,
             spamThreadIds
