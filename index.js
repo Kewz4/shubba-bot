@@ -58,6 +58,8 @@ const path = require('path');
 const http = require('http');
 const { createGeminiRunner, parseChain } = require('./lib/gemini-chain');
 const { PUNCHY_VERIFIED_KNOWLEDGE } = require('./lib/punchy-knowledge');
+const { GROUNDING_RULES, buildLanguageDirective } = require('./lib/answer-policy');
+const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LOCAL FILESYSTEM STORAGE SHIM
@@ -1030,16 +1032,32 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 //   GEMINI_CHAIN_WIKI="gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite"
 // Legacy single-model vars (GEMINI_MODEL_STANDARD / _WIKI) still work — they're
 // pinned to the FRONT of the chain for backward compatibility.
-// Defaults lead with gemini-3.6-flash (newest, smartest — verified working on
-// the project key) and fall back across separate free-quota buckets:
-// 3.6-flash → 3.5-flash → 2.5-flash → 2.5-flash-lite. Any model not enabled on
-// a given key is auto-dropped (404) at runtime, so this is safe to ship.
+// Defaults lead with gemini-3.7-flash and fall back across FIVE separate
+// free-quota buckets:
+//   3.7-flash → 3.6-flash → 3.5-flash → 2.5-flash → 2.5-flash-lite
+//
+// Why 3.7-flash at the front (verified 2026-08-14 against Google's own docs):
+//   - Model ID confirmed on https://ai.google.dev/gemini-api/docs/models and its
+//     dedicated page https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
+//     (page last updated 2026-08-13). Guessing an ID would 404 it out of the
+//     chain silently, so these were read off the docs, not assumed.
+//   - https://ai.google.dev/gemini-api/docs/pricing lists it as "Free of charge"
+//     on the free tier, same as every other model in this chain.
+//   - Google bills it as their most capable Flash model, aimed at complex
+//     reasoning — which is exactly this workload: log/crash triage plus
+//     multilingual replies (EN/BR/ES/RU) in one turn.
+//   3.6-flash stays as the immediate fallback because it is the model already
+//   verified working on this project's key, so a bad rollout degrades by one
+//   notch instead of going down.
+//
+// Any model not enabled on a given key is auto-dropped (404) at runtime, so
+// leading with the newest is safe even on older keys.
 const GEMINI_CHAIN_STANDARD = parseChain(
-    process.env.GEMINI_CHAIN_STANDARD || 'gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite',
+    process.env.GEMINI_CHAIN_STANDARD || 'gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite',
     process.env.GEMINI_MODEL_STANDARD // legacy override → front of chain
 );
 const GEMINI_CHAIN_WIKI = parseChain(
-    process.env.GEMINI_CHAIN_WIKI || 'gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite',
+    process.env.GEMINI_CHAIN_WIKI || 'gemini-3.7-flash,gemini-3.6-flash,gemini-3.5-flash,gemini-2.5-flash,gemini-2.5-flash-lite',
     process.env.GEMINI_MODEL_WIKI
 );
 // Back-compat: some older code paths still read these single names.
@@ -1214,7 +1232,32 @@ async function callGroq(prompt, opts = {}) {
 }
 
 /**
- * Call Gemini 2.5 Flash with automatic retry on transient failures.
+ * Build the generationConfig for ONE specific model in a chain.
+ *
+ * generationConfig is not model-agnostic, and the chain aborts on 400 by design
+ * (so real bugs aren't masked). That combination means a knob the front model
+ * accepts but the tail model rejects would take the whole chain down instead of
+ * failing over — the cheap safety-net model would never get to serve. So the
+ * config is resolved per model rather than once for the front of the chain.
+ *
+ * thinkingBudget:-1 = dynamic budget (model decides how much to think). Gemini 3
+ * prefers `thinking_level`, but Google's docs state thinking_budget "remains
+ * supported for backward compatibility", and thinkingBudget is what this key is
+ * already verified working with — so we keep it rather than swap in a field name
+ * we could not confirm the exact REST spelling of. Sending both would be a 400.
+ */
+function buildGenConfig(model, { temperature, maxOutputTokens, useThinking }) {
+    const cfg = { temperature, maxOutputTokens };
+    // flash-lite is the last-resort bucket; it is kept on a plain config so it
+    // can always answer, whatever the smarter models upstream were configured for.
+    if (useThinking && model && !model.includes('flash-lite')) {
+        cfg.thinkingConfig = { thinkingBudget: -1 };
+    }
+    return cfg;
+}
+
+/**
+ * Call Gemini with automatic multi-model failover and retry on transient failures.
  * 4xx errors are never retried — they indicate a permanent problem.
  *
  * useThinking=false → thinkingConfig omitted entirely (2.5 Pro rejects thinkingBudget:0)
@@ -1225,17 +1268,9 @@ async function callGemini(prompt, useThinking = false) {
     if (USE_GROQ) {
         return callGroq(prompt, { temperature: 0.7, maxTokens: 8192, label: 'standard' });
     }
-    const genConfig = { temperature: 0.7, maxOutputTokens: 8192 };
-    // Thinking is only attached for models that support it (flash-lite rejects it).
-    // The runner keeps this genConfig for every model in the chain; if a model
-    // rejects thinkingConfig it returns 400 and the runner surfaces it, so we
-    // only enable thinking when the front model is known to support it.
-    if (useThinking && GEMINI_MODEL_STANDARD && !GEMINI_MODEL_STANDARD.includes('flash-lite')) {
-        genConfig.thinkingConfig = { thinkingBudget: -1 };
-    }
     const { text } = await getGeminiRunner().runGeminiChain(prompt, {
         models: GEMINI_CHAIN_STANDARD,
-        genConfig,
+        genConfigFor: (model) => buildGenConfig(model, { temperature: 0.7, maxOutputTokens: 8192, useThinking }),
         timeout: 120000,
         label: `standard(thinking:${useThinking})`,
     });
@@ -1251,13 +1286,9 @@ async function callGeminiWiki(prompt) {
     if (USE_GROQ) {
         return callGroq(prompt, { temperature: 0.5, maxTokens: 8000, label: 'wiki-deep' });
     }
-    const genConfig = { temperature: 0.5, maxOutputTokens: 16384 };
-    if (GEMINI_MODEL_WIKI && !GEMINI_MODEL_WIKI.includes('flash-lite')) {
-        genConfig.thinkingConfig = { thinkingBudget: -1 };
-    }
     const { text } = await getGeminiRunner().runGeminiChain(prompt, {
         models: GEMINI_CHAIN_WIKI,
-        genConfig,
+        genConfigFor: (model) => buildGenConfig(model, { temperature: 0.5, maxOutputTokens: 16384, useThinking: true }),
         timeout: 180000,
         label: 'wiki-deep',
     });
@@ -8324,7 +8355,9 @@ client.on(Events.ThreadCreate, async (thread) => {
         
         const wikiPrompt = `You are Shubba, a knowledgeable wiki expert for the Punchy! Minecraft mod. You've READ and UNDERSTOOD the entire wiki.
 
-IMPORTANT: Respond in ${langInfo.name} (${langInfo.nativeName}).
+${GROUNDING_RULES}
+
+${buildLanguageDirective(langInfo)}
 
 USER'S QUESTION: ${starter.content}
 THREAD CONTEXT: "${thread.name}"
@@ -8457,6 +8490,37 @@ Example GOOD JSON format:
     }, 4000);
   }
 });
+
+// ── TEXT-CHANNEL @MENTION GATE ───────────────────────────────────────────────
+// Shubba used to answer in forum channels ONLY, so direct @mentions in ordinary
+// text channels were silently dropped (verified: "@Shubba hello" and "@Shubba
+// how to get the blur effect brilliant in swords" in #🤖│commands both got no
+// reply) while #💬│general-en ran on volunteers.
+//
+// Opening this up needs guard rails, not just a new branch: Shubba answers only
+// when EXPLICITLY mentioned (never on @everyone, never on ambient chatter), never
+// in the honeypot or staff/announcement channels, and at a capped rate per user
+// so one person can't drain the daily Gemini quota. All of that logic lives in
+// lib/mention-policy.js so it can be unit-tested without a Discord client.
+const MENTION_EXCLUDED_CHANNEL_IDS = [
+    FLYTRAP_CHANNEL_ID,      // honeypot — any reply here defeats the trap
+    DEV_CHANNEL_ID,          // private dev channel, has its own handling
+    TEASER_OUTPUT_CHANNEL_ID,
+    RULES_CHANNEL_ID,        // Shubba publishes these; it shouldn't chat in them
+    FAQ_CHANNEL_ID,
+    KNOWN_ISSUES_ID,
+    BUG_FIXES_CHANNEL_ID,
+    MUSIC_CHANNEL_ID,
+    DISCUSS_CHANNEL_ID,      // auto-threads every message; handled far above
+    TEASERS_CHANNEL_ID,
+];
+const mentionGate = createMentionGate({
+    excludedChannelIds: MENTION_EXCLUDED_CHANNEL_IDS,
+    cooldownMs: 15 * 1000,       // one answer per user per 15s
+    maxPerWindow: 5,             // ...and at most 5 per 10 minutes
+    windowMs: 10 * 60 * 1000,
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 client.on(Events.MessageCreate, async (message) => {
     // ── INSTANT KILL PATHS (run first, before anything else) ─────────────────
@@ -9232,6 +9296,118 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
     // Any user who @mentions Shubba in a thread gets a response.
     // Owners inside support/wiki threads fall through from the isOwner block above.
     // ============================================================
+    // ============================================================
+    // TEXT-CHANNEL @MENTION SUPPORT
+    // Everything below this point is forum-thread handling, so a direct
+    // @mention in a normal text channel used to fall off the end of the
+    // handler and get no reply at all. Answer it here, reusing the SAME
+    // askGemini() prompt path the forums use — same knowledge base, same
+    // grounding rules, same language mirroring — rather than a second brain
+    // that would drift from the forum one.
+    // ============================================================
+    if (!message.channel.isThread || !message.channel.isThread()) {
+        const gateResult = mentionGate.shouldAnswer({
+            channelId: message.channelId,
+            channelKind: channelKindOf(message.channel, ChannelType),
+            authorId: message.author.id,
+            isBot: message.author.bot,
+            isSelf: message.author.id === client.user.id,
+            // Explicit user mention ONLY. Without these flags, mentions.has()
+            // also returns true for a role Shubba happens to hold, for @everyone,
+            // and for the implicit ping Discord adds when someone merely replies
+            // to one of Shubba's messages — none of which are a summons, and the
+            // reply case would make Shubba answer its own follow-ups forever.
+            mentionsBot: message.mentions.has(client.user, {
+                ignoreRoles: true,
+                ignoreEveryone: true,
+                ignoreRepliedUser: true,
+            }),
+            mentionsEveryone: message.mentions.everyone,
+        });
+
+        if (!gateResult.allowed) {
+            // 'no-mention' is the overwhelmingly common case (ordinary chatter) —
+            // logging it would drown the console.
+            if (gateResult.reason !== 'no-mention' && gateResult.reason !== 'bot' && gateResult.reason !== 'self') {
+                console.log(`🔇 Mention in #${message.channel.name} not answered: ${gateResult.reason}`);
+            }
+            return;
+        }
+
+        console.log(`💬 Answering @mention from ${message.author.username} in #${message.channel.name}`);
+        try {
+            await message.channel.sendTyping();
+
+            // Strip the mention so the model sees the actual question, not "<@id> hi".
+            const question = message.content.replace(/<@!?\d+>/g, '').trim();
+            const { details, logContent } = await analyzeAttachments(message, message.channelId);
+
+            const effectiveContent = question || (message.attachments.size > 0
+                ? `[User sent ${message.attachments.size} file(s) with no text — see FILE DATA section]`
+                : '[User mentioned you with no message text — greet them and ask what they need]');
+
+            // Recent channel history gives the model enough context to honour the
+            // "don't repeat a remedy they already tried" rule in a busy channel.
+            let conversationContext = '';
+            try {
+                const recent = await message.channel.messages.fetch({ limit: 12 });
+                conversationContext = '=== RECENT CHANNEL CONVERSATION ===\n' +
+                    Array.from(recent.values()).reverse().map(m => {
+                        const who = m.author.id === client.user.id ? 'Shubba' : (m.member?.nickname || m.author.displayName || m.author.username);
+                        return `${who}: ${m.content.substring(0, 400)}`;
+                    }).join('\n');
+            } catch (e) {
+                console.log('⚠️ Could not fetch channel history for mention context:', e.message);
+            }
+            conversationContext += `\n\nThe person speaking to you is ${message.author.displayName || message.author.username} (ID: ${message.author.id}).\n`;
+
+            const detectedLang = detectLanguage(question || message.content);
+            const langInfo = SUPPORTED_LANGUAGES[detectedLang] || SUPPORTED_LANGUAGES['EN-US'];
+            if (detectedLang !== 'EN-US') console.log(`🌐 Mention language: ${langInfo.nativeName} (${detectedLang})`);
+
+            const freshKnowledge = await getFreshKnowledge();
+            const detectedVersion = logContent ? extractPunchyVersion(logContent) : null;
+
+            const rawAnswer = await askGemini(
+                effectiveContent,
+                // Shim: askGemini only reads .name/.parentId off this. isTextChannel
+                // flips it to channel-context mode so it never tells a user in a
+                // chat channel to "add tags to your post".
+                { name: message.channel.name, parentId: message.channel.parentId, isTextChannel: true },
+                [],                 // no forum tags exist in a text channel
+                details,
+                logContent,
+                [],                 // no tag-compliance gate outside the forum
+                conversationContext,
+                freshKnowledge,
+                false,              // deep analysis stays a forum/owner flow
+                detectedVersion,
+                false,              // never dev mode in a public text channel
+                langInfo
+            );
+
+            if (rawAnswer.startsWith('ERROR:')) {
+                await message.reply("⚠️ I couldn't work that one out right now. Try again in a moment, or open a post in <#" + SUPPORT_FORUM_ID + "> if it's a bug.").catch(() => {});
+                return;
+            }
+
+            // Strip the forum-only button signal — those buttons act on forum
+            // threads and are meaningless here.
+            const { cleanText, attachments } = processAiVisuals(rawAnswer);
+            const { text: parsedText } = parseButtonSignal(cleanText);
+            const chunks = splitMessage(parsedText);
+
+            await message.reply({ content: chunks[0], files: attachments });
+            for (let i = 1; i < chunks.length; i++) {
+                await message.channel.send(chunks[i]);
+            }
+        } catch (e) {
+            console.error('❌ Error answering text-channel mention:', e);
+            await message.reply('⚠️ I ran into an issue answering that. Please try again in a moment.').catch(() => {});
+        }
+        return;
+    }
+
     if (message.channel.parentId !== SUPPORT_FORUM_ID && message.channel.parentId !== WIKI_FORUM_ID) return;
     const thread = message.channel;
     const isWikiForum = thread.parentId === WIKI_FORUM_ID;
@@ -9401,7 +9577,9 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             
             const wikiPrompt = `You are Shubba, a knowledgeable wiki expert for the Punchy! Minecraft mod. Continue this conversation naturally.
 
-IMPORTANT: Respond in ${langInfo.name} (${langInfo.nativeName}).
+${GROUNDING_RULES}
+
+${buildLanguageDirective(langInfo)}
 
 THREAD CONTEXT: "${thread.name}"
 
@@ -10883,7 +11061,16 @@ async function handleInteractionCore(interaction) {
     }
 }
 
-async function askGemini(latest, thread, tags, files, data, missing, conversationContext, freshKnowledge, isDeep = false, detectedVersion = null, isOwnerQuery = false) {
+async function askGemini(latest, thread, tags, files, data, missing, conversationContext, freshKnowledge, isDeep = false, detectedVersion = null, isOwnerQuery = false, languageInfo = null) {
+  // Language hint for the prompt. Callers that already ran detectLanguage() pass
+  // it in; when they don't, we detect here so EVERY path (support forum, wiki,
+  // text-channel mentions) gets the same mirror-the-user rule rather than only
+  // the wiki forum, which is why a Russian user got no usable answer before.
+  if (!languageInfo && typeof latest === 'string' && latest.trim()) {
+      const code = detectLanguage(latest);
+      languageInfo = SUPPORTED_LANGUAGES[code] || null;
+  }
+
   // Build version context
   let versionContext = "";
   if (detectedVersion) {
@@ -10899,10 +11086,21 @@ async function askGemini(latest, thread, tags, files, data, missing, conversatio
   // Build thread context
   let threadContext = "";
   if (thread && thread.name) {
-      threadContext = `\n[THREAD CONTEXT]\n`;
-      threadContext += `Thread Title: ${thread.name}\n`;
-      threadContext += `Forum: ${thread.parentId === WIKI_FORUM_ID ? 'Wiki Questions' : 'Bug Reports/Support'}\n`;
-      threadContext += `Applied Tags: ${tags.join(', ') || 'None'}\n`;
+      if (thread.isTextChannel) {
+          // Mentioned in a normal chat channel — there is no forum post, no tags,
+          // and no tag gate. Say so, or the model invents thread/tag context.
+          threadContext = `\n[CHANNEL CONTEXT]\n`;
+          threadContext += `Channel: #${thread.name}\n`;
+          threadContext += `This is a normal chat channel, NOT a support forum post. There are no forum tags here.\n`;
+          threadContext += `Do NOT ask the user to add tags to their post or to edit a forum post — those do not exist in this channel.\n`;
+          threadContext += `If you need their Minecraft version or mod loader, just ask for it in plain words.\n`;
+          threadContext += `If this turns into a real bug report, point them to <#${SUPPORT_FORUM_ID}> to open a post.\n`;
+      } else {
+          threadContext = `\n[THREAD CONTEXT]\n`;
+          threadContext += `Thread Title: ${thread.name}\n`;
+          threadContext += `Forum: ${thread.parentId === WIKI_FORUM_ID ? 'Wiki Questions' : 'Bug Reports/Support'}\n`;
+          threadContext += `Applied Tags: ${tags.join(', ') || 'None'}\n`;
+      }
   }
 
   // These are ALWAYS injected directly — never truncated by the wiki/discord content
@@ -10914,10 +11112,14 @@ async function askGemini(latest, thread, tags, files, data, missing, conversatio
   const modelDecision = shouldUseThinking(latest, data.length > 100, isDeep);
   const useThinking = modelDecision.useThinking;
   
-  const prompt = isDeep ? 
+  const prompt = isDeep ?
     `ACT AS A SENIOR MINECRAFT MOD DEVELOPER & DEBUGGER. TASK: PERFORM A COMPREHENSIVE TECHNICAL ANALYSIS.
 
-[LOG FILE CONTENT] 
+${GROUNDING_RULES}
+
+${buildLanguageDirective(languageInfo)}
+
+[LOG FILE CONTENT]
 ${data.substring(0, 45000)}
 ${versionContext}
 ${threadContext}
@@ -10972,6 +11174,10 @@ How to avoid this in the future
 
 Be technical but clear. Reference specific lines from the log when relevant. If you see similar issues in the solved solutions database, reference those solutions. If the user is on an outdated version, strongly recommend updating as the first step.` :
     `You are Shubba, a thoughtful and discerning support companion for the Punchy! Minecraft mod. Your purpose is to be a competent first responder so users get real help fast, and so the developers (kewz. and PunchyMan) don't get spam-pinged with questions you could have handled. You are NOT a chatbot that sprays generic answers — you are a careful diagnostician who thinks before speaking.
+
+${GROUNDING_RULES}
+
+${buildLanguageDirective(languageInfo)}
 
 ════════════════════════════════════════════════════════════
 THE FOUR THINKING PRINCIPLES — APPLY THESE TO EVERY MESSAGE
