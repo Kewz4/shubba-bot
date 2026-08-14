@@ -5,3 +5,4 @@ node_modules/
 shubba-files/
 *.log
 package-lock.json
+.claude/worktrees/

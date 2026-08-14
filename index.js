@@ -1520,7 +1520,11 @@ const MODRINTH_API_BASE = 'https://api.modrinth.com/v2';
 // startup and by /setversion, so it cannot be derived from Modrinth without
 // changing how stored solutions are keyed.
 // ⚠️ UPDATE THIS PER RELEASE. Current line as of 2026-08-14: 2.6.x.
-let CURRENT_VERSION_SET = '2.6'; // Current version being documented
+// Single source of truth for the solutions bucket. Every fallback path below
+// must use this — they used to hardcode '2.4' independently, so any storage
+// failure silently rolled Shubba's knowledge back two minor versions.
+const DEFAULT_VERSION_SET = '2.6'; // ← bump per Punchy minor release
+let CURRENT_VERSION_SET = DEFAULT_VERSION_SET; // Current version being documented
 let SOLUTIONS_BY_VERSION = {}; // { '2.1': [...solutions], '2.2': [...solutions] }
 const MAX_SOLUTIONS_PER_VERSION = 50;
 
@@ -6092,8 +6096,8 @@ async function loadSolutionsFromGCS() {
         const [exists] = await file.exists();
         if (!exists) {
             console.log("📝 No solutions file found in GCS. Starting fresh.");
-            SOLUTIONS_BY_VERSION = { '2.4': [] };
-            CURRENT_VERSION_SET = '2.4';
+            SOLUTIONS_BY_VERSION = { [DEFAULT_VERSION_SET]: [] };
+            CURRENT_VERSION_SET = DEFAULT_VERSION_SET;
             await saveSolutionsToGCS();
             return;
         }
@@ -6102,15 +6106,15 @@ async function loadSolutionsFromGCS() {
         const parsed = JSON.parse(contents.toString('utf8'));
         
         SOLUTIONS_BY_VERSION = parsed.solutions || {};
-        CURRENT_VERSION_SET = parsed.currentVersion || '2.4';
+        CURRENT_VERSION_SET = parsed.currentVersion || DEFAULT_VERSION_SET;
         
         console.log(`✅ Loaded solutions from GCS. Current version: ${CURRENT_VERSION_SET}`);
         console.log(`   Solutions by version:`, Object.keys(SOLUTIONS_BY_VERSION).map(v => `${v}: ${SOLUTIONS_BY_VERSION[v].length}`).join(', '));
     } catch (e) {
         console.error("⚠️ Error loading solutions from GCS:", e.message);
         // Initialize with defaults if load fails
-        SOLUTIONS_BY_VERSION = { '2.4': [] };
-        CURRENT_VERSION_SET = '2.4';
+        SOLUTIONS_BY_VERSION = { [DEFAULT_VERSION_SET]: [] };
+        CURRENT_VERSION_SET = DEFAULT_VERSION_SET;
     }
 }
 
@@ -6639,15 +6643,19 @@ async function fetchModrinthVersions() {
         
         // Group versions by MC version and loader
         const versionMap = {};
-        const supportedVersions = ['1.20.1', '1.21.1', '1.21.5', '1.21.11', '26.1'];
+        // No hardcoded game-version allowlist: Modrinth only lists versions the
+        // mod actually ships for, so it IS the source of truth. The old
+        // ['1.20.1','1.21.1','1.21.5','1.21.11','26.1'] list silently discarded
+        // every newer release (26.1.1, 26.1.2, 26.2, 26.3-snapshot-*), which
+        // made this "live" fetch report stale data.
         const supportedLoaders = ['fabric', 'forge', 'neoforge'];
-        
+
         response.data.forEach(version => {
             const gameVersions = version.game_versions || [];
             const loaders = version.loaders || [];
-            
+
             gameVersions.forEach(mcVersion => {
-                if (supportedVersions.includes(mcVersion)) {
+                {
                     loaders.forEach(loader => {
                         const loaderLower = loader.toLowerCase();
                         if (supportedLoaders.includes(loaderLower)) {
@@ -7489,36 +7497,54 @@ async function analyzeAttachments(message, threadId) {
 
 async function applyTagsFromText(message, thread) {
     const content = message.content.toLowerCase();
-    const availableTags = thread.parent.availableTags;
-    const currentTags = new Set(thread.appliedTags);
-    let changed = false;
 
-    const tryAdd = (name) => {
-        const tag = availableTags.find(t => t.name.toLowerCase() === name.toLowerCase());
-        if (tag && !currentTags.has(tag.id)) { currentTags.add(tag.id); changed = true; }
-    };
+    // Collect desired tag NAMES in priority order. Discord caps a thread at 5
+    // tags, and a post like "crash with a visual glitch in a modpack on fabric
+    // 26.2" matches far more than 5. Ordering matters: whatever lands first
+    // survives the cap, so loader/version (which triage actually filters on)
+    // come before symptom labels.
+    const desiredNames = [];
 
     // Mod loaders
-    if (content.includes('neoforge') || content.includes('neo forge')) tryAdd('NeoForge');
-    else if (content.includes('forge')) tryAdd('Forge');
-    if (content.includes('fabric')) tryAdd('Fabric');
+    if (content.includes('neoforge') || content.includes('neo forge')) desiredNames.push('NeoForge');
+    else if (content.includes('forge')) desiredNames.push('Forge');
+    if (content.includes('fabric')) desiredNames.push('Fabric');
 
-    // Versions (check longest first to avoid '1.21' matching '1.21.11')
-    const sortedVersions = [...TAG_CATEGORIES.VERSIONS].filter(v => v !== 'All').sort((a, b) => b.length - a.length);
+    // Versions (check longest first so '1.21' can't shadow '1.21.11')
+    const sortedVersions = sortVersionsBySpecificity(
+        [...TAG_CATEGORIES.VERSIONS].filter(v => v !== 'All')
+    );
     for (const v of sortedVersions) {
-        if (content.includes(v)) { tryAdd(v); break; }
+        if (content.includes(v)) { desiredNames.push(v); break; }
     }
 
     // Issue types
-    if (content.includes('crash') || content.includes('fatal error') || content.includes('java.lang')) tryAdd('Crash / Fatal Error');
-    if (content.includes('visual') || content.includes('texture') || content.includes('render') || content.includes('graphic') || content.includes('glitch')) tryAdd('Visual Bug');
-    if (content.includes('animation') || content.includes('anim ')) tryAdd('Animation Bug');
-    if (content.includes('modpack') || content.includes('mod pack')) tryAdd('Modpack Issue');
-    if (content.includes('compat') || content.includes('conflict') || (content.includes('mod') && (content.includes('work together') || content.includes('doesnt work with') || content.includes("doesn't work with")))) tryAdd('Compatibility Issue');
+    if (content.includes('crash') || content.includes('fatal error') || content.includes('java.lang')) desiredNames.push('Crash / Fatal Error');
+    if (content.includes('visual') || content.includes('texture') || content.includes('render') || content.includes('graphic') || content.includes('glitch')) desiredNames.push('Visual Bug');
+    if (content.includes('animation') || content.includes('anim ')) desiredNames.push('Animation Bug');
+    if (content.includes('modpack') || content.includes('mod pack')) desiredNames.push('Modpack Issue');
+    if (content.includes('compat') || content.includes('conflict') || (content.includes('mod') && (content.includes('work together') || content.includes('doesnt work with') || content.includes("doesn't work with")))) desiredNames.push('Compatibility Issue');
 
-    if (changed) {
-        await thread.setAppliedTags([...currentTags]).catch(e => console.warn(`⚠️ Could not set tags: ${e.message}`));
-        console.log(`🏷️ Auto-applied tags to thread: "${thread.name}"`);
+    if (desiredNames.length === 0) return;
+
+    // Resolve against the forum's REAL tags and cap to Discord's limit. Passing
+    // an over-long array makes setAppliedTags() reject, and the old code
+    // swallowed that rejection — so a multi-symptom report ended up with NO
+    // tags while still logging success.
+    const existingIds = thread.appliedTags || [];
+    const finalIds = buildAppliedTagIds(thread.parent, desiredNames, existingIds);
+
+    // Nothing to do if the cap left us exactly where we started.
+    const unchanged = finalIds.length === existingIds.length
+        && finalIds.every(id => existingIds.includes(id));
+    if (unchanged) return;
+
+    try {
+        await thread.setAppliedTags(finalIds);
+        console.log(`🏷️ Auto-applied ${finalIds.length} tag(s) to thread: "${thread.name}"`);
+    } catch (e) {
+        // Log the real outcome — never claim success on failure.
+        console.warn(`⚠️ Could not set tags on "${thread.name}": ${e.message}`);
     }
 }
 

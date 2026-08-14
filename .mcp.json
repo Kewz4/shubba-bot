@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "discord": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["scripts/discord-mcp.js"]
+    }
+  }
+}
