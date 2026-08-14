@@ -3901,9 +3901,14 @@ const repliedTimers = new Map();
  * is automatically archived for inactivity.
  */
 async function handleRepliedCommand(interaction) {
-    if (!interaction.channel.isThread()) {
+    if (!interaction.channel?.isThread()) {
         return safeReply(interaction, { content: "❌ Can only be used inside a support thread.", flags: [MessageFlags.Ephemeral] });
     }
+
+    // Acknowledge before fetchStarterMessage() — that's a network round-trip and
+    // can easily outrun Discord's 3s window on a cold cache. Public, because this
+    // message is meant to ping the OP in the thread.
+    await safeDefer(interaction, {});
 
     const thread = interaction.channel;
 
@@ -3995,9 +4000,12 @@ async function handleRepliedCommand(interaction) {
  * Does NOT archive — gives the user a chance to fix their post.
  */
 async function handleWarning1Command(interaction) {
-    if (!interaction.channel.isThread()) {
+    if (!interaction.channel?.isThread()) {
         return safeReply(interaction, { content: "❌ Can only be used inside a support thread.", flags: [MessageFlags.Ephemeral] });
     }
+
+    // Acknowledge before the fetchStarterMessage() round-trip. Public reply.
+    await safeDefer(interaction, {});
 
     const thread = interaction.channel;
     let opId = null;
@@ -4034,9 +4042,12 @@ async function handleWarning1Command(interaction) {
  * Handle /close_report — final warning. Immediately archives the thread.
  */
 async function handleWarning2Command(interaction) {
-    if (!interaction.channel.isThread()) {
+    if (!interaction.channel?.isThread()) {
         return safeReply(interaction, { content: "❌ Can only be used inside a support thread.", flags: [MessageFlags.Ephemeral] });
     }
+
+    // Acknowledge before the fetchStarterMessage() round-trip. Public reply.
+    await safeDefer(interaction, {});
 
     const thread = interaction.channel;
     let opId = null;
@@ -4362,7 +4373,7 @@ async function handlePurge(interaction) {
 }
 
 async function handleNextUpdate(interaction) {
-    if (!interaction.channel.isThread()) {
+    if (!interaction.channel?.isThread()) {
         return safeReply(interaction, { content: '❌ Only works in a support thread.', flags: [MessageFlags.Ephemeral] });
     }
     await safeDefer(interaction, {});
@@ -9608,6 +9619,66 @@ async function safeEditReply(interaction, payload) {
     }
 }
 
+// Discord rejects modal text-input labels longer than 45 characters with
+// DiscordAPIError[50035] "Invalid Form Body". That error is thrown by showModal()
+// itself — i.e. before the interaction is ever acknowledged — so the user just
+// sees "The application did not respond" with nothing in the logs pointing at the
+// real cause. (This is exactly what broke /editrole: one label was 51 chars.)
+// Clamping here makes an over-long label a cosmetic truncation instead of a
+// total command failure, and logs loudly so it gets fixed properly.
+const MODAL_LABEL_MAX = 45;
+function clampModalLabel(label) {
+    if (typeof label !== 'string' || label.length <= MODAL_LABEL_MAX) return label;
+    console.warn(`⚠️ Modal label exceeds ${MODAL_LABEL_MAX} chars and was truncated: "${label}" (${label.length})`);
+    return label.slice(0, MODAL_LABEL_MAX);
+}
+
+/**
+ * Last-resort reporter so a throw inside a command handler never leaves the user
+ * staring at "The application did not respond".
+ *
+ * Choosing the wrong method here throws InteractionAlreadyReplied, so the three
+ * possible states are handled separately:
+ *   • untouched (!deferred && !replied) → reply()     — opens the response slot
+ *   • deferred only (deferred && !replied) → editReply() — fills the pending
+ *     "thinking" message, which otherwise hangs forever
+ *   • already answered (replied) → followUp() — reply/editReply/showModal has
+ *     already consumed the initial response slot
+ *
+ * Note discord.js sets `replied = true` on editReply() and on a *successful*
+ * showModal(); a showModal() that rejects leaves it false, so a modal command
+ * that blows up still lands in the reply() branch and the user gets told.
+ */
+async function reportInteractionFailure(interaction, error) {
+    const label = interaction?.commandName || interaction?.customId || 'unknown';
+
+    if (EXPIRED_INTERACTION_CODES.has(error?.code)) {
+        console.log(`⚠️ Interaction expired before response (code ${error.code}) — command: ${label}`);
+        return;
+    }
+
+    console.error(`❌ Unhandled interaction error | command: ${label} | ${error?.message}`);
+    if (error?.stack) console.error(error.stack);
+
+    // Autocomplete interactions have no reply()/editReply() — nothing to send.
+    if (typeof interaction?.reply !== 'function' || interaction.isAutocomplete?.()) return;
+
+    const content = '⚠️ Something went wrong running that command. The error has been logged — please try again, and let a mod know if it keeps happening.';
+    try {
+        if (!interaction.deferred && !interaction.replied) {
+            await interaction.reply({ content, flags: [MessageFlags.Ephemeral] });
+        } else if (interaction.deferred && !interaction.replied) {
+            await interaction.editReply({ content });
+        } else {
+            await interaction.followUp({ content, flags: [MessageFlags.Ephemeral] });
+        }
+    } catch (e) {
+        if (!EXPIRED_INTERACTION_CODES.has(e?.code)) {
+            console.error(`❌ Could not deliver failure notice for "${label}": ${e.message}`);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── SLASH COMMAND QUEUE ─────────────────────────────────────────────────────
@@ -9642,16 +9713,53 @@ const SELECT_MENU_COMMANDS = new Set([
     'orderroles',
 ]);
 
-function shouldQueueDefer(commandName) {
-    return !INSTANT_COMMANDS.has(commandName) && !MODAL_COMMANDS.has(commandName) && !SELECT_MENU_COMMANDS.has(commandName);
+// Commands whose answer is meant for the whole channel. Everything else is
+// acknowledged ephemerally.
+//
+// This list has to match what the handler itself passes to safeDefer/safeReply:
+// once an interaction is deferred, its ephemerality is fixed, and flags passed to
+// a later editReply are silently ignored by Discord. Deferring everything
+// ephemerally (as this code used to) quietly turned public commands like
+// /replied and /warn into messages only the invoker could see.
+const DEFER_PUBLIC_COMMANDS = new Set([
+    'solve', 'modstats', 'nextupdate',
+    'replied', 'info_request', 'close_report',
+    'warn', 'mute', 'unmute', 'kick', 'ban', 'unban', 'clearwarnings',
+]);
+
+// Permission gates. These are pure in-memory checks, so they run BEFORE the
+// defer — that keeps a denial ephemeral even for commands that defer publicly.
+const STRICT_ADMIN_COMMANDS = new Set([
+    'restart', 'refresh_knowledge', 'test_wiki', 'faq_preview', 'faq_reset',
+    'versions', 'solutions', 'reteaser', 'renameteaser', 'recoverteasers',
+    'passive', 'auditaddons',
+]);
+const MODERATION_COMMANDS = new Set([
+    'warn', 'mute', 'unmute', 'kick', 'ban', 'unban', 'warnings', 'clearwarnings', 'purge',
+]);
+
+// Modal / select-menu / instant commands own their initial response, so they must
+// reach it on a fresh, unacknowledged interaction.
+function shouldAckUpFront(commandName) {
+    return !INSTANT_COMMANDS.has(commandName)
+        && !MODAL_COMMANDS.has(commandName)
+        && !SELECT_MENU_COMMANDS.has(commandName);
+}
+
+function deferOptionsFor(commandName) {
+    return DEFER_PUBLIC_COMMANDS.has(commandName) ? {} : { flags: [MessageFlags.Ephemeral] };
 }
 
 async function enqueueUserCommand(userId, fn) {
     const prev = userCommandQueue.get(userId) || Promise.resolve();
     const next = prev.catch(() => {}).then(fn);
     userCommandQueue.set(userId, next);
-    // Cleanup when this is the last command in the queue
-    next.finally(() => {
+    // Cleanup when this is the last command in the queue.
+    // NOTE: this deliberately hangs the cleanup off a swallowed copy of `next`.
+    // `next.finally(cb)` returns a NEW promise that rejects whenever `next`
+    // rejects; nothing was handling that promise, so any throwing command
+    // produced an unhandled rejection — which terminates the process on Node 18+.
+    next.catch(() => {}).finally(() => {
         if (userCommandQueue.get(userId) === next) {
             userCommandQueue.delete(userId);
         }
@@ -9661,37 +9769,60 @@ async function enqueueUserCommand(userId, fn) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 client.on(Events.InteractionCreate, async (interaction) => {
-    // For chat input commands (slash commands), serialize per-user
-    if (interaction.isChatInputCommand()) {
-        const userId = interaction.user.id;
-        const cmdName = interaction.commandName;
+    // Buttons, modal submits and select menus acknowledge inside their own
+    // branches — they don't need queueing.
+    if (!interaction.isChatInputCommand()) {
+        return handleInteractionCore(interaction);
+    }
 
-        // Defer up front so Discord gets its ack within 3s — UNLESS this command
-        // shows a modal or exits the process.
-        if (shouldQueueDefer(cmdName)) {
-            await safeDefer(interaction, { flags: [MessageFlags.Ephemeral] }).catch(() => {});
-        }
+    const userId = interaction.user.id;
+    const cmdName = interaction.commandName;
 
-        // If the user already has commands queued, queue this one too
-        if (userCommandQueue.has(userId)) {
-            console.log(`⏳ Queueing /${cmdName} for ${interaction.user.username} — ${userCommandQueue.size} user(s) currently have queued work`);
-            return enqueueUserCommand(userId, () => handleInteractionCore(interaction)).catch(e => {
-                if (!EXPIRED_INTERACTION_CODES.has(e.code)) {
-                    console.error(`❌ Queued interaction error: ${e.message}`);
-                }
+    try {
+        // ── 1. Permission gates — synchronous, so no ack needed first ────────
+        // Running these before the defer keeps denials ephemeral even for
+        // commands that otherwise answer publicly.
+        const isOwner = DEV_IDS.includes(userId);
+        const isAdmin = interaction.member?.permissions.has(PermissionFlagsBits.Administrator) ?? false;
+
+        if (STRICT_ADMIN_COMMANDS.has(cmdName) && !isAdmin && !isOwner) {
+            return await safeReply(interaction, {
+                content: '❌ This command is for admins only.',
+                flags: [MessageFlags.Ephemeral],
             });
         }
 
-        // First command for this user — register and run immediately
-        return enqueueUserCommand(userId, () => handleInteractionCore(interaction)).catch(e => {
-            if (!EXPIRED_INTERACTION_CODES.has(e.code)) {
-                console.error(`❌ Interaction error: ${e.message}`);
-            }
-        });
-    }
+        if (MODERATION_COMMANDS.has(cmdName)
+            && !isOwner && !isAdmin
+            && !interaction.member?.roles.cache.has(MOD_ROLE_ID)) {
+            return await safeReply(interaction, {
+                content: `❌ You need the <@&${MOD_ROLE_ID}> role to use moderation commands.`,
+                flags: [MessageFlags.Ephemeral],
+            });
+        }
 
-    // Buttons and modals don't need queueing — handle directly
-    return handleInteractionCore(interaction);
+        // ── 2. Commands that own their initial response ──────────────────────
+        // showModal()/select menus need a fresh, unacknowledged interaction, so
+        // these must neither be deferred NOR queued: making a modal wait behind a
+        // slow /solve is precisely how the 3-second window gets missed.
+        if (!shouldAckUpFront(cmdName)) {
+            return await handleInteractionCore(interaction);
+        }
+
+        // ── 3. Acknowledge BEFORE any awaited work ───────────────────────────
+        // Everything past this point may take as long as it needs.
+        await safeDefer(interaction, deferOptionsFor(cmdName));
+
+        // ── 4. Serialize per-user so rapid commands don't interleave ─────────
+        if (userCommandQueue.has(userId)) {
+            console.log(`⏳ Queueing /${cmdName} for ${interaction.user.username} — ${userCommandQueue.size} user(s) currently have queued work`);
+        }
+        return await enqueueUserCommand(userId, () => handleInteractionCore(interaction));
+    } catch (e) {
+        // handleInteractionCore catches its own errors; this covers failures in
+        // the gate/defer path itself.
+        await reportInteractionFailure(interaction, e);
+    }
 });
 
 async function handleInteractionCore(interaction) {
@@ -9721,7 +9852,7 @@ async function handleInteractionCore(interaction) {
             }
 
             // Case 2: Used inside a support/wiki thread → archive the thread
-            if (!interaction.channel.isThread()) {
+            if (!interaction.channel?.isThread()) {
                 return await safeReply(interaction, { content: "This command only works in threads or ticket channels.", flags: [MessageFlags.Ephemeral] });
             }
             
@@ -10324,19 +10455,19 @@ async function handleInteractionCore(interaction) {
                 .setTitle('Create Addon Subscriber Role');
             modal.addComponents(
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('roleName').setLabel('Role Name').setPlaceholder('e.g. My Cool Addon Updates').setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(true)
+                    new TextInputBuilder().setCustomId('roleName').setLabel(clampModalLabel('Role Name')).setPlaceholder('e.g. My Cool Addon Updates').setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(true)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('roleColor').setLabel('Primary Color (hex) or "holo"').setPlaceholder('#7c6ff7  OR  holo').setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(false)
+                    new TextInputBuilder().setCustomId('roleColor').setLabel(clampModalLabel('Primary Color (hex) or "holo"')).setPlaceholder('#7c6ff7  OR  holo').setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(false)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('roleColor2').setLabel('Secondary Color for gradient (hex, optional)').setPlaceholder('#4fc3f7  — leave blank for solid color').setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(false)
+                    new TextInputBuilder().setCustomId('roleColor2').setLabel(clampModalLabel('Secondary Color (hex, optional)')).setPlaceholder('#4fc3f7  — leave blank for solid color').setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(false)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('roleIcon').setLabel('Icon URL (optional, 64x64 PNG/JPG)').setPlaceholder('https://i.imgur.com/icon.png').setStyle(TextInputStyle.Short).setRequired(false)
+                    new TextInputBuilder().setCustomId('roleIcon').setLabel(clampModalLabel('Icon URL (optional, 64x64 PNG/JPG)')).setPlaceholder('https://i.imgur.com/icon.png').setStyle(TextInputStyle.Short).setRequired(false)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('rolePosition').setLabel('Above Punchers role? (yes/no)').setPlaceholder('yes').setStyle(TextInputStyle.Short).setMaxLength(3).setRequired(false)
+                    new TextInputBuilder().setCustomId('rolePosition').setLabel(clampModalLabel('Above Punchers role? (yes/no)')).setPlaceholder('yes').setStyle(TextInputStyle.Short).setMaxLength(3).setRequired(false)
                 )
             );
             return interaction.showModal(modal);
@@ -10359,19 +10490,22 @@ async function handleInteractionCore(interaction) {
                 .setTitle('Edit Addon Role');
             modal.addComponents(
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('roleName').setLabel('New Role Name (blank = keep current)').setPlaceholder(addon.roleName || 'Current name').setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(false)
+                    new TextInputBuilder().setCustomId('roleName').setLabel(clampModalLabel('New Role Name (blank = keep)')).setPlaceholder(addon.roleName || 'Current name').setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(false)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('roleColor').setLabel('Primary Color (hex / "holo", blank = keep)').setPlaceholder('#7c6ff7  OR  holo').setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(false)
+                    new TextInputBuilder().setCustomId('roleColor').setLabel(clampModalLabel('Primary Color (hex/"holo", blank = keep)')).setPlaceholder('#7c6ff7  OR  holo').setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(false)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('roleColor2').setLabel('Secondary Color for gradient (hex, "none" = remove)').setPlaceholder('#4fc3f7  — leave blank to keep current').setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(false)
+                    // NOTE: keep this under 45 chars — Discord rejects longer labels
+                    // with 50035 and showModal() then throws before the interaction
+                    // is ever acknowledged. That was the /editrole outage.
+                    new TextInputBuilder().setCustomId('roleColor2').setLabel(clampModalLabel('Secondary Color (hex, "none" = remove)')).setPlaceholder('#4fc3f7  — leave blank to keep current').setStyle(TextInputStyle.Short).setMaxLength(7).setRequired(false)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('roleIcon').setLabel('Icon URL (blank = keep, "none" = remove)').setPlaceholder('https://i.imgur.com/icon.png  OR  none').setStyle(TextInputStyle.Short).setRequired(false)
+                    new TextInputBuilder().setCustomId('roleIcon').setLabel(clampModalLabel('Icon URL (blank = keep, "none" = remove)')).setPlaceholder('https://i.imgur.com/icon.png  OR  none').setStyle(TextInputStyle.Short).setRequired(false)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('rolePosition').setLabel('Above Punchers role? (yes/no, blank = keep)').setPlaceholder('yes').setStyle(TextInputStyle.Short).setMaxLength(3).setRequired(false)
+                    new TextInputBuilder().setCustomId('rolePosition').setLabel(clampModalLabel('Above Punchers role? (yes/no, blank=keep)')).setPlaceholder('yes').setStyle(TextInputStyle.Short).setMaxLength(3).setRequired(false)
                 )
             );
             return interaction.showModal(modal);
@@ -10380,7 +10514,10 @@ async function handleInteractionCore(interaction) {
         if (interaction.commandName === 'orderroles') {
             // Find every addon role this user has — DEDUPED by roleId so we never
             // produce duplicate select options (Discord rejects those with 50035).
-            const memberRoles = interaction.member.roles.cache;
+            const memberRoles = interaction.member?.roles?.cache;
+            if (!memberRoles) {
+                return safeReply(interaction, { content: '❌ Could not read your roles. Try again in a moment.', flags: [MessageFlags.Ephemeral] });
+            }
             const seenRoleIds = new Set();
             const myAddonRoles = [];
             for (const a of Object.values(addonRolesStore)) {
@@ -10739,13 +10876,10 @@ async function handleInteractionCore(interaction) {
         }
     }
     } catch (e) {
-        // Global interaction error handler — silently drop expired interactions,
-        // log anything else
-        if (EXPIRED_INTERACTION_CODES.has(e.code)) {
-            console.log(`⚠️ Interaction expired before response (code ${e.code}) — command: ${interaction.commandName || interaction.customId || 'unknown'}`);
-        } else {
-            console.error(`❌ Unhandled interaction error:`, e.message, `| command: ${interaction.commandName || interaction.customId || 'unknown'}`);
-        }
+        // Global interaction error handler. Expired interactions are dropped
+        // quietly; anything else is logged AND surfaced to the user, so a throw
+        // never leaves them looking at "The application did not respond".
+        await reportInteractionFailure(interaction, e);
     }
 }
 
