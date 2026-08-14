@@ -1322,7 +1322,6 @@ let isDependentsScraping = false;
 const DEV_CHANNEL_ID = '1445064610188230736';
 
 const GALLERY_CHANNEL_ID = '1451583342972633341';
-const ADDONS_CHANNEL_ID = '1452338871034445844';
 const SUGGESTIONS_CHANNEL_ID = '1433994233567776878';
 const ROADMAP_CHANNEL_ID = '1445072140733780058';
 
@@ -1343,13 +1342,91 @@ const DEV_IDS = ['422458713987612685', '1413670292970274836'];
 const MOD_ROLE_ID = '1480084666408239379'; // Moderator role — can use moderation slash commands
 const OWNER_ID = '422458713987612685'; // Primary owner (kewz.)
 const PUNCHYMAN_ID = '1413670292970274836'; // Co-owner/developer (PunchyMan)
-const WIKI_LINK = 'https://github.com/punchy-guys/punchy-wiki/wiki';
+// Canonical, user-facing wiki. The old GitHub wiki (github.com/punchy-guys/
+// punchy-wiki/wiki) is STALE — see docs/PUNCHY_KNOWLEDGE.md. Never link users there.
+const WIKI_LINK = 'https://wiki.punchymod.com/';
+
+// ── FORUM TAGS ───────────────────────────────────────────────────────────────
+// TAG_CATEGORIES used to be a hardcoded list, which went stale every time a new
+// Minecraft version shipped (26.1.1 / 26.1.2 / 26.2 / 26.3-snapshot-8 were all
+// untaggable). The forum channel itself is the source of truth: discord.js
+// exposes `channel.availableTags` ({ id, name, emoji, moderated }) at runtime.
+//
+// TAG_CATEGORIES is now a live view over those tags. It keeps the same shape
+// (.VERSIONS / .LOADERS / .ISSUES string arrays) so every existing reader works
+// unchanged, but the contents come from Discord. If the tags cannot be read we
+// fall back to the verified list in lib/forum-tags.js.
+const {
+    MAX_FORUM_TAGS,
+    categorizeTags: _categorizeForumTags,
+    resolveTagIds: resolveForumTagIds,
+    capTagIds: capForumTagIds,
+    sortVersionsBySpecificity: sortVersionsBySpecificity
+} = require('./lib/forum-tags');
+
+// Starts as the verified fallback; replaced by live forum tags once the client
+// is ready. categorizeTags(null) returns the fallback, so this is never empty.
+let _forumTagCategories = _categorizeForumTags(null);
+let _forumTagsFetchedAt = 0;
+let _forumTagsRefreshing = false;
+const FORUM_TAG_CACHE_TTL_MS = 10 * 60 * 1000; // re-read the forums every 10 min
+
+/**
+ * Refresh the cached tag categories from the two tagged forums, in the
+ * background. Self-priming: triggered by reads of TAG_CATEGORIES, so no
+ * startup wiring is required. Never throws and never blocks the caller.
+ */
+function _refreshForumTagCategories() {
+    const now = Date.now();
+    if (_forumTagsRefreshing || (now - _forumTagsFetchedAt) < FORUM_TAG_CACHE_TTL_MS) return;
+
+    let discordClient;
+    try { discordClient = client; } catch (_) { return; }   // not initialised yet
+    if (!discordClient || typeof discordClient.isReady !== 'function' || !discordClient.isReady()) return;
+
+    _forumTagsRefreshing = true;
+    _forumTagsFetchedAt = now;  // stamp up-front so a failure cannot hot-loop
+
+    Promise.all(
+        [SUPPORT_FORUM_ID, WIKI_FORUM_ID].map(id =>
+            discordClient.channels.fetch(id).catch(() => null)
+        )
+    ).then(channels => {
+        const live = channels
+            .filter(Boolean)
+            .flatMap(ch => (Array.isArray(ch.availableTags) ? ch.availableTags : []));
+        if (live.length) {
+            _forumTagCategories = _categorizeForumTags(live);
+        } else {
+            console.warn('⚠️ Forum tags unreadable — keeping fallback tag categories.');
+        }
+    }).catch(e => {
+        console.warn(`⚠️ Forum tag refresh failed (${e.message}) — keeping fallback.`);
+    }).finally(() => { _forumTagsRefreshing = false; });
+}
 
 const TAG_CATEGORIES = {
-    VERSIONS: ['All', '1.20.1', '1.21.1', '1.21.5', '1.21.11', '26.1'],
-    LOADERS: ['Fabric', 'Forge', 'NeoForge'],
-    ISSUES: ['Visual Bug', 'Animation Bug', 'Modpack Issue', 'Compatibility Issue', 'Crash / Fatal Error', 'Duplicate']
+    get VERSIONS() { _refreshForumTagCategories(); return _forumTagCategories.VERSIONS; },
+    get LOADERS()  { _refreshForumTagCategories(); return _forumTagCategories.LOADERS; },
+    get ISSUES()   { _refreshForumTagCategories(); return _forumTagCategories.ISSUES; }
 };
+
+/**
+ * Resolve tag NAMES against a forum's real tags and return an id list that is
+ * already capped to Discord's 5-tags-per-thread limit. Use this instead of
+ * building a tag-id array by hand — over-long arrays make setAppliedTags()
+ * throw, and a swallowed throw applies NO tags at all.
+ */
+function buildAppliedTagIds(forumChannel, desiredNames, existingIds = []) {
+    const availableTags = (forumChannel && Array.isArray(forumChannel.availableTags))
+        ? forumChannel.availableTags : [];
+    return capForumTagIds({
+        existingIds,
+        desiredIds: resolveForumTagIds(availableTags, desiredNames),
+        availableTags,
+        max: MAX_FORUM_TAGS
+    });
+}
 
 // MULTILINGUAL SUPPORT - Language codes matching wiki folder structure
 const SUPPORTED_LANGUAGES = {
@@ -1368,17 +1445,40 @@ const MODRINTH_PROJECT_ID = 'punchy-fpa'; // Modrinth project slug
 const MODRINTH_API_BASE = 'https://api.modrinth.com/v2';
 
 // SOLUTIONS STORAGE
-let CURRENT_VERSION_SET = '2.4'; // Current version being documented
+// Keyed by Punchy minor line ('2.4', '2.6', ...). This is the *solutions bucket*
+// label, not a claim about the latest release — it is overwritten from GCS on
+// startup and by /setversion, so it cannot be derived from Modrinth without
+// changing how stored solutions are keyed.
+// ⚠️ UPDATE THIS PER RELEASE. Current line as of 2026-08-14: 2.6.x.
+let CURRENT_VERSION_SET = '2.6'; // Current version being documented
 let SOLUTIONS_BY_VERSION = {}; // { '2.1': [...solutions], '2.2': [...solutions] }
 const MAX_SOLUTIONS_PER_VERSION = 50;
 
-// GitHub wiki raw content URLs — new structure: /{LANG}/{PageName}-{LANG}.md
+// ── WIKI SOURCES ─────────────────────────────────────────────────────────────
+// Two different things, deliberately kept separate:
+//
+//   WIKI_LINK (above)  — what we SHOW users. wiki.punchymod.com is canonical.
+//   WIKI_BASE_URL      — where we INGEST article text from, for the knowledge base.
+//
+// They differ because wiki.punchymod.com currently has NO machine-readable
+// article content. Verified 2026-08-14: every route (/en-us/home, /en-us/compat,
+// /en-us/debug, ...) serves one byte-identical 26,572-byte client-rendered
+// shell, the page reports its own status as "Guias: 0 / 0 não sincronizado"
+// (0 guides, 0 synced), there is no /api/ route, no __NEXT_DATA__ payload, and
+// the site itself links back to the GitHub wiki as "GitHub Original".
+// So the GitHub raw markdown remains the only actual source of article text.
+// ⚠️ Once wiki.punchymod.com finishes syncing its guides, repoint ingestion at it.
 const WIKI_BASE_URL = 'https://raw.githubusercontent.com/wiki/punchy-guys/punchy-wiki/';
+
+// NOTE: 'Punchy!-Mod-Debug-Position' was REMOVED on purpose — do not re-add it.
+// It documents INSERT / PAGE UP / HOME / PAGE DOWN / END debug keybinds that do
+// not exist in current builds, and mislabels F8 as "Mirror" when F8 opens the
+// menu. Ingesting it made Shubba cite known-false docs to users.
+// See docs/PUNCHY_KNOWLEDGE.md; correct keybinds are in lib/punchy-knowledge.js.
 const WIKI_PAGES = [
     'Bucket-Creatures-Physics-Wiki-Model-Parts',
     'Model-Parts-Bedrock-Items-System-API',
     'Model-Parts-Particle-System',
-    'Punchy!-Mod-Debug-Position',
     'Punchy!-Resource-Pack-Compatibility-Guide',
     'Punchy!-Resource-Pack-Models-and-Geo-Mapping',
     'Specific-Animation-&-More-Tuning-System',
@@ -1397,7 +1497,12 @@ const WIKI_PAGES = [
 // with users. This knowledge is for Shubba's reasoning only.
 // Owner-only questions about dev internals are allowed.
 // ============================================================
-const PUNCHY_STATIC_KNOWLEDGE = `--- PUNCHY! 2.5 — RELEASE NOTES (Latest major version) ---
+const PUNCHY_STATIC_KNOWLEDGE = `--- PUNCHY! 2.5 — RELEASE NOTES (HISTORICAL, not the latest release) ---
+NOTE ON VERSIONS: 2.5 is NOT current. The current line is 2.6.x. Never tell a
+user 2.5 is the latest. The authoritative live version list is fetched from the
+Modrinth API at runtime (see the MODRINTH / CURRENT VERSIONS section of the
+fresh-knowledge block) — always prefer that over any number written below.
+
 New in 2.5:
 - Minecraft 26.1, 26.1.1, and 26.1.2 support added (Punchy 26 line)
 - New face-spawn particle system matching vanilla behavior (lava, milk, snow, water buckets, leaf blocks)
@@ -1434,9 +1539,16 @@ Important version notes for 2.5:
 MOD IDENTITY:
 - Mod ID: punchy | License: ARR (All Rights Reserved) — proprietary, do not share code
 - Client-side only mod (no server jar needed)
-- Supports: Fabric, Forge, NeoForge | Minecraft 26.1, 1.21.11, 1.21.5, 1.21.1, 1.20.1 | Java 21+
-- 26.1, 1.21.11, 1.21.5, 1.21.1: Fabric + Forge + NeoForge
+- Supports: Fabric, Forge, NeoForge. NO Quilt.
+- Minecraft versions (verified against the Modrinth API 2026-08-14; the live
+  Modrinth fetch is authoritative if it disagrees): 1.20.1, 1.21.1, 1.21.5,
+  1.21.11, 26.1, 26.1.1, 26.1.2, 26.2, and the 26.3 snapshot line.
+- Java: 21+ on the older lines, but the floor RISES with the MC version — the
+  26.2 build needs Java 25 or newer. A "won't launch" report on 26.2 is very
+  often just an old Java. Ask for exact MC version + Java version + loader.
+- 26.x, 1.21.11, 1.21.5, 1.21.1: Fabric + Forge + NeoForge
 - 1.20.1: Fabric + Forge only (no NeoForge on 1.20.1)
+- Fabric builds REQUIRE Fabric API even though Modrinth does not list it as a dep.
 - Built on Fabric API; Forge/NeoForge ports are separate artifacts
 
 CONFIG SYSTEM:
@@ -1482,7 +1594,9 @@ CONFIG OPTIONS (full list, all toggleable):
 
 F8 — UNIFIED PUNCHY MENU (single keybind for everything):
 - Press F8 in-game to open the Punchy! main menu — this is the central hub for ALL Punchy features
-- The F8 menu replaces the older split between F8 (settings) and F9 (positioner). F9 NO LONGER EXISTS.
+- F8 is also how the Tuning Workbench is reached (via a button in the menu), replacing the old F8/F9 split for the positioner.
+- F9 still EXISTS as the Tuning Workbench control key (it closes the Workbench in current builds) — it is simply not how players open the positioner any more.
+- ⚠️ F9 COLLISION: Better Fishing's "options" keybind ALSO defaults to F9. If a user has both mods installed and F9 "does the wrong thing", that is the conflict — have them rebind one in Options ▸ Controls.
 - Everything is now under F8: mod settings, blacklist, Mix Pack selection, AND the Hand Positioner
 
 F8 ▸ HAND POSITIONER (the player tool for fixing arm/item positions):
@@ -1504,7 +1618,9 @@ F8 ▸ MIX PACK SELECTION (new in 2.5):
 - Lets users layer multiple animation packs simultaneously
 - Pick a favorite animation per item across loaded packs
 
-REGULAR PLAYERS: Direct them to F8 ▸ Hand Positioner for ANY positioning issue. Never mention F9 (it does not exist anymore). Never mention /punchy debug, tuning keybinds (Insert/Delete/PageUp/PageDown/F6), or creator_tuning_helper.json — those are the resource-pack-creator workflow, not for normal users.
+REGULAR PLAYERS: Direct them to F8 ▸ Hand Positioner for ANY positioning issue. Don't send players to F9 or the Tuning Workbench, and don't mention /punchy debugposition, the creator tuning keybinds, or creator_tuning_helper.json — those are the resource-pack-creator workflow, not for normal users. (F9 does still exist as the Workbench control; just don't route players there. The ONE time to raise F9 with a player is the Better Fishing keybind collision above.)
+NEVER tell a user to install GeckoLib. It is NOT required and NOT bundled — only 8 very early 1.0.7 alpha/beta builds ever needed it.
+The INSERT / PAGE UP / HOME / PAGE DOWN / END "debug position" keybinds do NOT exist in current builds. The old GitHub wiki page documenting them is stale and has been removed from ingestion — never repeat its contents.
 
 RESOURCE PACK CREATORS / DEVELOPERS — DIFFERENT WORKFLOW:
 Pack creators who want bulk JSON-based tuning across many items use the Resource Pack Compatibility Guide:
@@ -1874,7 +1990,7 @@ COMMON ISSUES AND CAUSES:
 - "Better Combat attack animations wrong": toggle betterCombatCompat in config
 - "Custom animation pack not working": resource pack must be above other packs in load order; check wiki for animation format docs
 - "Crash on startup": usually a mod version mismatch — check Punchy jar filename matches MC version and loader
-- "Item or arm position looks off / wrong position": Direct the user to press **F8**, then click **Hand Positioner**. It has live sliders (offX/offY/offZ, rotX/rotY/rotZ, scale) with real-time preview — no commands needed. Players must NEVER be told to use debug commands, tuning keybinds, or F6/F9 — those don't exist for players in 2.5+.
+- "Item or arm position looks off / wrong position": Direct the user to press **F8**, then click **Hand Positioner**. It has live sliders (offX/offY/offZ, rotX/rotY/rotZ, scale) with real-time preview — no commands needed. Players must NEVER be routed to debug commands, creator tuning keybinds, or F6/F9 — those are the pack-creator workflow, not the player one. (F6/F9 do exist; they are just not the answer here.)
 
 MOD COMPATIBILITY POLICY (IMPORTANT):
 - Punchy! is a complex first-person animation mod. Java modding makes it extremely difficult to guarantee compatibility with every other mod in existence.
@@ -2525,27 +2641,34 @@ const DEFAULT_FAQ_EMBEDS = [
     {
         id: "header",
         title: "📋 Punchy! Frequently Asked Questions",
-        description: `**Last Update:** March 22, 2026  |  **Version:** 2.4\n**Supported Versions:** 26.1, 1.21.11, 1.21.5, 1.21.1 (Fabric, Forge, NeoForge) | 1.20.1 (Fabric, Forge)`
+        // ⚠️ Supported-version list verified against the Modrinth API on 2026-08-14.
+        // Update per release. No mod-version number here on purpose — it rots fastest.
+        description: `**Supported Versions:** 26.2, 26.1.2, 26.1.1, 26.1, 1.21.11, 1.21.5, 1.21.1 (Fabric, Forge, NeoForge) | 1.20.1 (Fabric, Forge)\nAlways grab the newest build for your Minecraft version → <https://modrinth.com/mod/punchy-fpa/versions>`
     },
     {
         id: "older_versions",
         title: "🚀 Will older versions (below 1.21.11) still get updates?",
-        description: `**Yes!** We currently use **26.1** as our development base, but we actively backport features to all older supported versions.`
+        // Deliberately version-free: naming a dev base here rots on every MC release
+        // and this FAQ is seed data that is rarely re-posted. The live supported-version
+        // list comes from the Modrinth fetch instead.
+        description: `**Yes!** We develop against the newest Minecraft release, but we actively backport features to all older supported versions.`
     },
     {
         id: "config",
         title: "⚙️ How do I configure the mod settings?",
-        description: `Press **F8**, Punchy! 2.4 no longer needs dependencies for config.\n\nIf you have a configuration UI mod installed you can also access settings via **Mods › Punchy! › Config**:\n• **Fabric:** Install [Mod Menu](https://modrinth.com/mod/modmenu)\n• **Forge / NeoForge:** Install [Configured](https://www.curseforge.com/minecraft/mc-mods/configured)`
+        // Version number dropped on purpose — it is not load-bearing (the sentence
+        // works without it) and it went stale at 2.4 while releases reached 2.6.x.
+        description: `Press **F8** — Punchy! no longer needs any extra dependency for config.\n\nIf you have a configuration UI mod installed you can also access settings via **Mods › Punchy! › Config**:\n• **Fabric:** Install [Mod Menu](https://modrinth.com/mod/modmenu)\n• **Forge / NeoForge:** Install [Configured](https://www.curseforge.com/minecraft/mc-mods/configured)`
     },
     {
         id: "resource_pack",
         title: "🎨 My Resource Pack isn't working with the mod?",
-        description: `We have added workarounds to ensure **most** resource packs work automatically, but some issues may persist.\n\n**Dev fix:** Add explicit compatibility via our wiki → <https://github.com/punchy-guys/punchy-wiki/wiki/Punchy!-Resource-Pack-Compatibility-Guide-EN-US>\n\nPress **F8** → **Hand Positioner** to access the brand-new live position editor with sliders.\n\n**Quick fix via Config (also under F8):**\n• **Single item:** Add the specific ID (e.g. \`examplemod:item_name\`)\n• **Whole mod:** Add the mod ID (e.g. \`examplemod\`) to disable Punchy rendering for all its items\n*This reverts those items to standard vanilla rendering.*\n\nFor questions about documentation or custom animations, ask in <#${WIKI_FORUM_ID}>.`
+        description: `We have added workarounds to ensure **most** resource packs work automatically, but some issues may persist.\n\n**Dev fix:** Add explicit compatibility — see our wiki → <${WIKI_LINK}>\n*(Compatibility Guide mirror, until the new wiki finishes syncing: <https://github.com/punchy-guys/punchy-wiki/wiki/Punchy!-Resource-Pack-Compatibility-Guide-EN-US>)*\n\nPress **F8** → **Hand Positioner** to access the brand-new live position editor with sliders.\n\n**Quick fix via Config (also under F8):**\n• **Single item:** Add the specific ID (e.g. \`examplemod:item_name\`)\n• **Whole mod:** Add the mod ID (e.g. \`examplemod\`) to disable Punchy rendering for all its items\n*This reverts those items to standard vanilla rendering.*\n\nFor questions about documentation or custom animations, ask in <#${WIKI_FORUM_ID}>.`
     },
     {
         id: "packs",
         title: "📦 Where can I find supported packs?",
-        description: `• **[Official Compatibility Collection](https://modrinth.com/collection/GypBAs4y)** — A curated list of packs with explicit Punchy! support.\n• Check <#${ADDONS_CHANNEL_ID}> to find or share community-made packs.`
+        description: `• **[Official Compatibility Collection](https://modrinth.com/collection/GypBAs4y)** — A curated list of packs with explicit Punchy! support.\n• Check <#${ADDON_FORUM_ID}> to find or share community-made packs.`
     },
     {
         id: "gallery",

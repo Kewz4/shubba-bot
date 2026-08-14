@@ -10,7 +10,15 @@ Shubba's understanding of the mod comes from two layers:
 
 The static reference was built from analysis of the shipping **punchy-2.6.x jar**
 plus the current wiki at **wiki.punchymod.com** (the newer numbered pages, which
-match current code — prefer them over the older GitHub wiki). It intentionally
+match current code — prefer them over the older GitHub wiki).
+
+> ⚠️ **Re-verified 2026-08-14:** those numbered pages are **not currently
+> readable** at wiki.punchymod.com — the site reports 0 synced guides and serves
+> an empty shell on every route (details in "Wiki sources" below). The facts in
+> `lib/punchy-knowledge.js` still stand on the jar analysis, but they could not
+> be re-confirmed against the live wiki on this date.
+
+It intentionally
 contains only **user-actionable** facts (config keys, file paths, keybinds,
 item/arm kinds, known issues) — no internal class names, matching the bot's
 existing "don't leak internals" rule.
@@ -27,6 +35,51 @@ advice:
    wiki's "Mod Debug Position" page is stale.
 3. **Better Fishing's options keybind defaults to F9** — the same key Punchy uses
    for its Tuning Workbench. A predictable conflict when both are installed.
+
+## Wiki sources: what we link vs. what we ingest (verified 2026-08-14)
+
+These are deliberately two different URLs in `index.js`:
+
+| Constant | Value | Purpose |
+| --- | --- | --- |
+| `WIKI_LINK` | `https://wiki.punchymod.com/` | Canonical link **shown to users** |
+| `WIKI_BASE_URL` | `raw.githubusercontent.com/wiki/punchy-guys/punchy-wiki/` | Article text **ingested** by `getFreshKnowledge()` |
+
+They differ because **wiki.punchymod.com currently serves no machine-readable
+article content.** Measured directly:
+
+- Every route (`/en-us/home`, `/en-us/compat`, `/en-us/debug`, …) returns one
+  byte-identical **26,572-byte** client-rendered shell.
+- The page reports its own status as **"Guias: 0 / 0 não sincronizado"**
+  (0 guides, 0 synced).
+- No `/api/` route, no `__NEXT_DATA__` / `__next_f` payload to parse.
+- `sitemap.xml` lists 113 URLs (8 locales × 14 slugs: `home`, `animation`,
+  `animation-effects`, `animation-conditions`, `dynamic-textures`,
+  `model-parts-items`, `model-parts-overview`, `model-parts-variants`,
+  `particles`, `pendulum-physics`, `compat`, `flags-reference`, `debug`,
+  `tutorials`) — but they are routes, not yet content.
+- The site itself links back to the GitHub wiki, labelled "GitHub Original".
+
+So the GitHub raw markdown remains the only actual source of article prose.
+**When wiki.punchymod.com finishes syncing, repoint `WIKI_BASE_URL` at it** —
+its locale codes are lowercase (`en-us`), unlike the GitHub `EN-US` folders.
+
+`Punchy!-Mod-Debug-Position` has been **removed from `WIKI_PAGES`** and must not
+be re-added: it documents the non-existent INSERT/PAGE UP/HOME/PAGE DOWN/END
+keybinds and mislabels F8 as "Mirror".
+
+## Forum tags come from Discord, not from code
+
+`TAG_CATEGORIES` in `index.js` is no longer a hardcoded list. It is a live view
+over the two forums' `channel.availableTags` (`#🪲│bug-report`
+`1433994315402838127`, `#⁉️│wiki-questions` `1465397633085345914`), refreshed in
+the background every 10 minutes. Adding a version tag in Discord is now enough —
+no code change. Pure helpers live in `lib/forum-tags.js` (tested in
+`test/forum-tags.test.js`), including the explicit **5-tags-per-thread cap**
+Discord enforces.
+
+`FALLBACK_TAG_CATEGORIES` is used only if the API read fails; it is current as
+of 2026-08-14 and must be updated per Minecraft release.
 
 ## Keeping it current
 
