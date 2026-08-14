@@ -1,39 +1,74 @@
 # Deploying Shubba
 
-Shubba now loads **all secrets from environment variables** — nothing sensitive
-is in the code, so the repo is safe to keep public. This means you **must** set
-env vars on the host or the bot exits on startup with a message telling you which
-ones are missing.
+Shubba loads **all secrets from environment variables** — as of the change that
+added this note, no credential is hardcoded in the source, so the repo can stay
+public. You **must** set env vars on the host: required ones missing means the
+bot exits on startup naming them, and the admin dashboard stays locked until its
+own two are set.
+
+> **History — read this before assuming you're safe.** Earlier commits on this
+> repo's public history *did* contain live credentials in `index.js`: the Gemini
+> key and Discord token, the admin dashboard login (`DASHBOARD_USER` /
+> `DASHBOARD_PASS`), and a CurseForge API key. Removing them from the current
+> file does **not** remove them from git history — anyone can still read them
+> with `git log -p`. Rotation below is mandatory, not optional. Until every one
+> of these is rotated, treat all of them as public.
 
 ## 1. Rotate the exposed secrets (do this first)
 
-These were previously hardcoded in the public repo, so treat them as compromised
-and regenerate them:
+These were hardcoded in the public repo at some point, so treat them as
+compromised and regenerate them:
 
 | Secret | Where to rotate |
 |---|---|
 | Gemini API key | https://aistudio.google.com/apikey → delete old, create new |
 | Discord bot token | Developer Portal → your app → Bot → **Reset Token** |
+| **Dashboard password** (`DASHBOARD_PASS`) | No provider to rotate at — **choose a new one yourself** and set it in the env. The old value `Punchy>HMI` is public forever; never reuse it. Generate a strong one: `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`. Change `DASHBOARD_USER` off `ShubbaAdmin` too, since that's equally public. |
+| **CurseForge API key** (`CF_API_KEY`) | https://console.curseforge.com/ → **API Keys** → revoke/delete the exposed key, generate a new one, paste it into the env |
 | Trello key/token | https://trello.com/power-ups/admin → regenerate (only if you use Trello sync) |
 | Groq key | https://console.groq.com/keys (only if `USE_GROQ=true`) |
 
 > Rotating the Discord token invalidates the old one everywhere — update the env
 > var in the same sitting so the bot doesn't go down.
 
+The dashboard is the urgent one: it's served on a **public IP** (see
+`PUBLIC_BASE_URL`) and its `/api/` routes can restart the bot and rewrite its
+config, so a publicly-known password there is remote control of the bot for
+anyone who finds the port.
+
 ## 2. Set env vars on SparkedHost
 
-Panel → your server → **Startup** tab → **Variables**. At minimum:
+Panel → your server → **Startup** tab → **Variables**. Required — the bot exits
+without these:
 
 ```
 DISCORD_TOKEN   = <your new bot token>
 GEMINI_API_KEY  = <your new gemini key>
 ```
 
-Everything else is optional — see `.env.example` for the full list with comments.
-If your panel doesn't expose arbitrary variables, create a `.env` file next to
-`index.js` via the file manager (it's gitignored) — but `index.js` reads
-`process.env` directly, so panel variables are preferred. (If you want `.env`
-file support, add `require('dotenv').config()` at the top and the `dotenv` dep.)
+Required to use the admin dashboard at all — without both, every `/dashboard`,
+`/admin` and `/api/` request returns 401 (the bot itself runs fine):
+
+```
+DASHBOARD_USER  = <a name that isn't "ShubbaAdmin">
+DASHBOARD_PASS  = <a freshly generated strong password>
+```
+
+There is **no default and no fallback** for those two by design. If you see
+`⚠️ DASHBOARD_USER / DASHBOARD_PASS not set — the admin dashboard is LOCKED` in
+the boot log, that's the panel refusing to serve rather than opening up with a
+built-in password.
+
+Optional (feature is skipped if unset, with a warning at boot): `CF_API_KEY`,
+`TRELLO_KEY` / `TRELLO_TOKEN`, `GROQ_API_KEY`. See **`.env.example` in the repo
+root** for the complete list of every variable `index.js` reads, with comments
+and defaults.
+
+`index.js` loads `dotenv` at the top with `override: true`, so a `.env` file
+next to `index.js` works and **wins over panel variables** when both set the
+same name. That override exists because the panel carries a stale masked
+`GEMINI_API_KEY`. `.env` is gitignored; `.env.example` is committed and must
+never hold real values.
 
 ## 3. Get the code onto the host
 

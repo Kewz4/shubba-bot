@@ -167,18 +167,39 @@ const PORT = process.env.PORT || process.env.SERVER_PORT || 8080;
 
 // ============================================================
 // ADMIN DASHBOARD — Shubba Control Panel
-// Auth: ShubbaAdmin / Punchy>HMI
 // ============================================================
-const DASHBOARD_USER = 'ShubbaAdmin';
-const DASHBOARD_PASS = 'Punchy>HMI';
+// Credentials are ENV-ONLY. This dashboard is reachable on a PUBLIC IP (see
+// PUBLIC_BASE_URL above), so there is deliberately NO default and NO fallback:
+// if either var is unset the panel refuses EVERY login instead of shipping a
+// well-known password. Set DASHBOARD_USER / DASHBOARD_PASS to enable it.
+// The startup check further down reports it when the dashboard is locked.
+const DASHBOARD_USER = process.env.DASHBOARD_USER || '';
+const DASHBOARD_PASS = process.env.DASHBOARD_PASS || '';
+const DASHBOARD_ENABLED = Boolean(DASHBOARD_USER && DASHBOARD_PASS);
 
 const BOT_START_TIME = Date.now();
 
+/**
+ * Constant-time string compare, so the public-facing panel can't leak the
+ * password byte-by-byte through response timing.
+ */
+function credsMatch(a, b) {
+    const ab = Buffer.from(String(a), 'utf8');
+    const bb = Buffer.from(String(b), 'utf8');
+    if (ab.length !== bb.length) return false;
+    return require('crypto').timingSafeEqual(ab, bb);
+}
+
+/**
+ * Basic-auth gate for /dashboard, /admin and every /api/ route.
+ * FAILS CLOSED: with no credentials configured, nobody authenticates.
+ */
 function requireAuth(req) {
+    if (!DASHBOARD_ENABLED) return false;   // unconfigured → locked, never open
     const auth = req.headers['authorization'] || '';
     if (!auth.startsWith('Basic ')) return false;
     const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
-    return decoded === `${DASHBOARD_USER}:${DASHBOARD_PASS}`;
+    return credsMatch(decoded, `${DASHBOARD_USER}:${DASHBOARD_PASS}`);
 }
 
 function sendAuth(res) {
@@ -1052,6 +1073,18 @@ function getGeminiRunner() {
         console.error('   Secrets are no longer hardcoded — see docs/DEPLOY.md.');
         process.exit(1);
     }
+
+    // Optional secrets: the bot still boots, but the feature they gate stays OFF.
+    // Reported (not fatal) so a half-configured host is obvious from the log.
+    // NOTE: only vars declared ABOVE this point may be referenced here — later
+    // `const`s (CF_API_KEY, TRELLO_KEY, …) are still in the temporal dead zone
+    // and warn at their own declaration instead.
+    if (!DASHBOARD_ENABLED) {
+        console.warn('⚠️ DASHBOARD_USER / DASHBOARD_PASS not set — the admin dashboard is LOCKED.');
+        console.warn('   Every /dashboard, /admin and /api request will get 401 until both are set.');
+        console.warn('   This is intentional: the panel is exposed on a public IP, so it never');
+        console.warn('   falls back to a built-in password. See .env.example and docs/DEPLOY.md.');
+    }
 })();
 
 // One-time startup fingerprint (safe: length + last 4 chars only) so a bad key
@@ -1258,7 +1291,13 @@ const TEASERS_GCS_FOLDER = 'teasers'; // Folder inside your GCS bucket
 const DISCUSS_CHANNEL_ID = '1441945608993771710';       // Every message here gets an auto discussion thread
 
 // ── MOD ANALYTICS (download tracking for Punchy! vs Hold My Items) ──────────
-const CF_API_KEY = '$2a$10$bL4bIL5pUWqfcO7KQtnMReakwtfHbNKh6v1uTpKlzhwoueEJQnPnm';
+// optional; CurseForge download stats skipped if unset (Modrinth still tracked).
+// Get a key at https://console.curseforge.com/ → API Keys.
+const CF_API_KEY = process.env.CF_API_KEY || '';
+if (!CF_API_KEY) {
+    console.warn('⚠️ CF_API_KEY not set — CurseForge download stats disabled; Modrinth tracking unaffected.');
+    console.warn('   Get a key at https://console.curseforge.com/ → API Keys, then set CF_API_KEY.');
+}
 const MOD_ANALYTICS_GCS_KEY = 'mod-analytics/snapshots.json';
 const MOD_ANALYTICS_INTERVAL_MS = 3 * 60 * 60 * 1000; // every 3 hours
 const MOD_ANALYTICS_MAX_HISTORY = 240;                 // 240 snapshots = 30 days @ 3h
@@ -5008,6 +5047,10 @@ async function fetchModrinthDownloads(slug) {
 }
 
 async function fetchCurseForgeDownloads(cfSlug) {
+    // Optional integration. Without a key, skip this source — collectModSnapshot
+    // catches it, marks the source ok:false and still saves the Modrinth numbers,
+    // so analytics degrade instead of the snapshot (or the bot) falling over.
+    if (!CF_API_KEY) throw new Error('CF_API_KEY not set — CurseForge stats skipped');
     if (!cfModIdCache[cfSlug]) {
         const search = await axios.get(
             `https://api.curseforge.com/v1/mods/search?gameId=432&slug=${cfSlug}&pageSize=1`,
