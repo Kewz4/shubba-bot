@@ -1,10 +1,14 @@
 # Deploying Shubba
 
-Shubba loads **all secrets from environment variables** — as of the change that
-added this note, no credential is hardcoded in the source, so the repo can stay
-public. You **must** set env vars on the host: required ones missing means the
-bot exits on startup naming them, and the admin dashboard stays locked until its
-own two are set.
+Shubba loads **every secret from environment variables** — no private credential
+is hardcoded in the source, so the repo can stay public. You **must** set env
+vars on the host: required ones missing means the bot exits on startup naming
+them, and the admin dashboard stays locked until its own two are set.
+
+The one literal left in the source is `CF_API_KEY`, a **public/shared**
+CurseForge key (confirmed by the repo owner) kept as a default so download
+analytics work with no host configuration. If that ever becomes a key tied to
+your own account, delete the literal and make it env-only again.
 
 > **History — read this before assuming you're safe.** Earlier commits on this
 > repo's public history *did* contain live credentials in `index.js`: the Gemini
@@ -24,7 +28,7 @@ compromised and regenerate them:
 | Gemini API key | https://aistudio.google.com/apikey → delete old, create new |
 | Discord bot token | Developer Portal → your app → Bot → **Reset Token** |
 | **Dashboard password** (`DASHBOARD_PASS`) | No provider to rotate at — **choose a new one yourself** and set it in the env. The old value `Punchy>HMI` is public forever; never reuse it. Generate a strong one: `node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"`. Change `DASHBOARD_USER` off `ShubbaAdmin` too, since that's equally public. |
-| **CurseForge API key** (`CF_API_KEY`) | https://console.curseforge.com/ → **API Keys** → revoke/delete the exposed key, generate a new one, paste it into the env |
+| ~~CurseForge API key~~ (`CF_API_KEY`) | **No action needed.** The repo owner confirms this is a public/shared key, not a personal secret, so it ships as a built-in default. Set `CF_API_KEY` only if you want to use your own. |
 | Trello key/token | https://trello.com/power-ups/admin → regenerate (only if you use Trello sync) |
 | Groq key | https://console.groq.com/keys (only if `USE_GROQ=true`) |
 
@@ -59,8 +63,9 @@ There is **no default and no fallback** for those two by design. If you see
 the boot log, that's the panel refusing to serve rather than opening up with a
 built-in password.
 
-Optional (feature is skipped if unset, with a warning at boot): `CF_API_KEY`,
-`TRELLO_KEY` / `TRELLO_TOKEN`, `GROQ_API_KEY`. See **`.env.example` in the repo
+Optional (feature is skipped if unset, with a warning at boot):
+`TRELLO_KEY` / `TRELLO_TOKEN`, `GROQ_API_KEY`. (`CF_API_KEY` has a working
+built-in default and is not required.) See **`.env.example` in the repo
 root** for the complete list of every variable `index.js` reads, with comments
 and defaults.
 
@@ -77,7 +82,7 @@ never hold real values.
 ```bash
 git pull origin claude/discord-bot-faq-command-hcqWd
 npm install
-npm test        # optional, should print: # pass 18
+npm test        # optional, should print: # pass 68
 ```
 
 **Option B — file manager:** upload `index.js`, the `lib/` folder, and
@@ -104,5 +109,11 @@ line and Gemini calls logging which model in the chain answered, e.g.
   reasoning + multilingual, also free) at the front once you've confirmed it's
   enabled on your key.
 
-The failover logic is covered by `npm test` (18 tests, including daily-429
-rotation, 404 drop, transient retry, and 400-abort).
+The failover logic is covered by `npm test` (68 tests total, including daily-429
+rotation, 404 drop, transient retry, 400-abort, forum-tag capping, and the
+interaction-acknowledgement paths).
+
+> **Note on Option A above:** SparkedHost runs Pterodactyl, whose **Console tab
+> is not a shell** — it pipes input to the running bot's stdin, so `git pull`
+> typed there does nothing. Use the Startup tab's git/auto-update variables, or
+> upload via the File Manager / SFTP instead.

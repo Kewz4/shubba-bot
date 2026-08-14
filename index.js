@@ -1324,11 +1324,16 @@ const DISCUSS_CHANNEL_ID = '1441945608993771710';       // Every message here ge
 // ── MOD ANALYTICS (download tracking for Punchy! vs Hold My Items) ──────────
 // optional; CurseForge download stats skipped if unset (Modrinth still tracked).
 // Get a key at https://console.curseforge.com/ → API Keys.
-const CF_API_KEY = process.env.CF_API_KEY || '';
-if (!CF_API_KEY) {
-    console.warn('⚠️ CF_API_KEY not set — CurseForge download stats disabled; Modrinth tracking unaffected.');
-    console.warn('   Get a key at https://console.curseforge.com/ → API Keys, then set CF_API_KEY.');
-}
+// CurseForge Core API key. Per the repo owner this is a PUBLIC/shared key, not
+// a personal secret, so it ships as the default and the analytics keep working
+// with no host configuration. Set CF_API_KEY in the environment to override it
+// with your own — the env var always wins.
+//
+// If that ever stops being true — i.e. this becomes a key tied to your own
+// CurseForge account — delete the literal and make this env-only again, because
+// this repo is PUBLIC.
+const CF_API_KEY_PUBLIC_DEFAULT = '$2a$10$bL4bIL5pUWqfcO7KQtnMReakwtfHbNKh6v1uTpKlzhwoueEJQnPnm';
+const CF_API_KEY = process.env.CF_API_KEY || CF_API_KEY_PUBLIC_DEFAULT;
 const MOD_ANALYTICS_GCS_KEY = 'mod-analytics/snapshots.json';
 const MOD_ANALYTICS_INTERVAL_MS = 3 * 60 * 60 * 1000; // every 3 hours
 const MOD_ANALYTICS_MAX_HISTORY = 240;                 // 240 snapshots = 30 days @ 3h
