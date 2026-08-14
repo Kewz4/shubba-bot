@@ -1534,34 +1534,90 @@ let SOLUTIONS_BY_VERSION = {}; // { '2.1': [...solutions], '2.2': [...solutions]
 const MAX_SOLUTIONS_PER_VERSION = 50;
 
 // ── WIKI SOURCES ─────────────────────────────────────────────────────────────
-// Two different things, deliberately kept separate:
+//   WIKI_LINK (above) — what we SHOW users. wiki.punchymod.com is canonical.
+//   WIKI_DATA_URL     — where we INGEST article text from (see below).
 //
-//   WIKI_LINK (above)  — what we SHOW users. wiki.punchymod.com is canonical.
-//   WIKI_BASE_URL      — where we INGEST article text from, for the knowledge base.
-//
-// They differ because wiki.punchymod.com currently has NO machine-readable
-// article content. Verified 2026-08-14: every route (/en-us/home, /en-us/compat,
-// /en-us/debug, ...) serves one byte-identical 26,572-byte client-rendered
-// shell, the page reports its own status as "Guias: 0 / 0 não sincronizado"
-// (0 guides, 0 synced), there is no /api/ route, no __NEXT_DATA__ payload, and
-// the site itself links back to the GitHub wiki as "GitHub Original".
-// So the GitHub raw markdown remains the only actual source of article text.
+// An earlier note here claimed wiki.punchymod.com had no machine-readable
+// content, because every HTML route serves one identical client-rendered shell.
+// That was true of the HTML and wrong as a conclusion: the SPA loads its whole
+// corpus from a JSON asset that IS publicly served —
+//   https://wiki.punchymod.com/assets/wiki-data.json  → 200, ~705 KB
+// 104 pages: 13 topics x 8 languages (EN-US, PT-BR, ES-ES, FR-FR, DE-DE, RU-RU,
+// ZH-CN, JA-JP), matching SUPPORTED_LANGUAGES exactly. Verified 2026-08-14:
+// 13/13 topics resolve per language, ~75-81 KB of article text each, one
+// request, ~360 ms. Check the JSON before concluding the site is unscrapeable.
 // ⚠️ Once wiki.punchymod.com finishes syncing its guides, repoint ingestion at it.
-const WIKI_BASE_URL = 'https://raw.githubusercontent.com/wiki/punchy-guys/punchy-wiki/';
+// ⚠️ HISTORY — do not "restore" the old raw.githubusercontent.com ingestion.
+// Shubba used to fetch article text from
+//   https://raw.githubusercontent.com/wiki/punchy-guys/punchy-wiki/<LANG>/<Page>-<LANG>.md
+// with page names like 'Punchy!-Resource-Pack-Compatibility-Guide'. Verified
+// 2026-08-14: EVERY one of those URLs returns 404, and so does the correct
+// numbered filename — that wiki is no longer publicly readable. The result was
+// that getFreshKnowledge() silently ingested NOTHING and Shubba answered wiki
+// questions from static text alone, which is what made it invent mechanisms.
+//
+// The live wiki site is a client-rendered SPA (every HTML route returns an
+// identical empty shell), but it publishes its full corpus as one JSON asset,
+// which IS publicly fetchable. That is now the single source of article text.
+const WIKI_DATA_URL = 'https://wiki.punchymod.com/assets/wiki-data.json';
 
-// NOTE: 'Punchy!-Mod-Debug-Position' was REMOVED on purpose — do not re-add it.
-// It documents INSERT / PAGE UP / HOME / PAGE DOWN / END debug keybinds that do
-// not exist in current builds, and mislabels F8 as "Mirror" when F8 opens the
-// menu. Ingesting it made Shubba cite known-false docs to users.
-// See docs/PUNCHY_KNOWLEDGE.md; correct keybinds are in lib/punchy-knowledge.js.
+// Language-independent topic keys. Each page in wiki-data.json has
+// id === `${lang}-${topic}`, so these work across all 8 languages.
 const WIKI_PAGES = [
-    'Bucket-Creatures-Physics-Wiki-Model-Parts',
-    'Model-Parts-Bedrock-Items-System-API',
-    'Model-Parts-Particle-System',
-    'Punchy!-Resource-Pack-Compatibility-Guide',
-    'Punchy!-Resource-Pack-Models-and-Geo-Mapping',
-    'Specific-Animation-&-More-Tuning-System',
+    'animation',                 // Animation and Tuning Reference
+    'compat',                    // Compat Pack Reference
+    'debug',                     // Tuning Editor and Debug (/punchy debugposition)
+    'model-parts-overview',
+    'model-parts-items',
+    'particles',
+    'dynamic-textures',
+    'pendulum-physics',
+    'animation-effects',
+    'model-parts-variants',
+    'animation-conditions',
+    'flags-reference',
+    'tutorials',
 ];
+
+// Whole-corpus cache. One request serves every page in every language, so this
+// is far cheaper than the old per-page fetch fan-out.
+let _wikiData = null;
+let _wikiDataFetchedAt = 0;
+const WIKI_DATA_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+async function loadWikiData(force = false) {
+    const now = Date.now();
+    if (!force && _wikiData && (now - _wikiDataFetchedAt) < WIKI_DATA_TTL_MS) return _wikiData;
+    try {
+        const res = await axios.get(WIKI_DATA_URL, { timeout: 30000, validateStatus: s => s === 200 });
+        const pages = res.data?.pages;
+        if (!Array.isArray(pages) || pages.length === 0) throw new Error('no pages array');
+        _wikiData = res.data;
+        _wikiDataFetchedAt = now;
+        console.log(`📚 Wiki corpus loaded: ${pages.length} pages, generated ${res.data.generatedAt || 'unknown'}`);
+        return _wikiData;
+    } catch (e) {
+        console.warn(`⚠️ Wiki corpus fetch failed (${e.message}) — keeping previous copy if any.`);
+        return _wikiData; // stale beats nothing; null means callers degrade to static knowledge
+    }
+}
+
+/** Look up one page from the cached corpus. Returns null if not loaded/found. */
+function getWikiPageMeta(topic, langCode = 'EN-US') {
+    if (!_wikiData?.pages) return null;
+    const id = `${String(langCode).toLowerCase()}-${topic}`;
+    return _wikiData.pages.find(p => p.id === id)
+        || _wikiData.pages.find(p => p.id === `en-us-${topic}`) // fall back to English
+        || null;
+}
+
+/** Canonical, citable URL for a topic — never hand-build wiki URLs elsewhere. */
+function wikiPageUrl(topic, langCode = 'EN-US') {
+    const meta = getWikiPageMeta(topic, langCode);
+    if (meta?.url) return meta.url;
+    const lang = String(langCode).toLowerCase();
+    return `https://wiki.punchymod.com/${lang}/${topic}`;
+}
 
 // ============================================================
 // PUNCHY 2.4+ STATIC FEATURE KNOWLEDGE
@@ -7009,31 +7065,40 @@ function buildSolutionsKnowledge() {
     return knowledge;
 }
 
+/**
+ * Resolve one wiki page. `pageName` is a topic key from WIKI_PAGES.
+ *
+ * Served from the whole-corpus cache rather than one HTTP request per page —
+ * loadWikiData() fetches all 104 pages (13 topics x 8 languages) in a single
+ * call, so this is a lookup, not a network round-trip.
+ *
+ * Returns the same { name, content, langCode } shape callers already expect,
+ * plus title/url so answers can cite the real page.
+ */
 async function fetchWikiPage(pageName, langCode = 'EN-US', retryCount = 0) {
-    try {
-        const pageFileName = `${pageName}-${langCode}.md`;
-        const url = `${WIKI_BASE_URL}${langCode}/${pageFileName}`;
-        
-        console.log(`Fetching: ${url} (attempt ${retryCount + 1})`);
-        
-        const response = await axios.get(url, { 
-            timeout: 30000,
-            validateStatus: (status) => status === 200
-        });
-        
-        console.log(`✅ Successfully fetched: ${pageFileName} (${response.data.length} chars)`);
-        return { name: pageName, content: response.data, langCode: langCode };
-    } catch (e) {
-        // Retry up to 2 times on timeout
-        if ((e.code === 'ECONNABORTED' || e.message.includes('timeout')) && retryCount < 2) {
-            console.log(`⏳ Timeout on ${pageName}, retrying... (${retryCount + 1}/2)`);
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            return fetchWikiPage(pageName, langCode, retryCount + 1);
-        }
-        
-        console.log(`⚠️ Failed to fetch wiki page: ${pageName} (${langCode}) - ${e.message}`);
+    await loadWikiData();
+    const meta = getWikiPageMeta(pageName, langCode);
+
+    if (!meta || !meta.content) {
+        console.log(`⚠️ Wiki page not in corpus: ${pageName} (${langCode})`);
         return null;
     }
+
+    // A request for a translated page can fall back to English; say so, because
+    // silently returning English while claiming the user's language is how
+    // wrong-language answers happen.
+    const servedLang = (meta.lang || '').toUpperCase();
+    if (servedLang && servedLang !== String(langCode).toUpperCase()) {
+        console.log(`ℹ️ ${pageName}: no ${langCode} page, serving ${servedLang}`);
+    }
+
+    return {
+        name: pageName,
+        content: meta.content,
+        langCode: servedLang || langCode,
+        title: meta.title,
+        url: meta.url,
+    };
 }
 
 async function getFreshKnowledge(forceRefresh = false, langCode = 'EN-US') {
@@ -8380,8 +8445,10 @@ client.on(Events.ThreadCreate, async (thread) => {
         const freshKnowledge = await getFreshKnowledge(true, detectedLang);
         
         const wikiLinks = WIKI_PAGES.map(page => {
-            const url = `https://github.com/punchy-guys/punchy-wiki/wiki/${page}-${detectedLang}`;
-            return `${page.replace(/-/g, ' ')}: <${url}>`;
+            // Canonical URL comes from the wiki corpus, never hand-built — the
+            // old `${page}-${lang}` GitHub form 404s for every page.
+            const meta = getWikiPageMeta(page, detectedLang);
+            return `${meta?.title || page.replace(/-/g, ' ')}: <${wikiPageUrl(page, detectedLang)}>`;
         }).join('\n');
         
         const wikiPrompt = `You are Shubba, a knowledgeable wiki expert for the Punchy! Minecraft mod. You've READ and UNDERSTOOD the entire wiki.
