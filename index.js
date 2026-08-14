@@ -1583,11 +1583,19 @@ const WIKI_PAGES = [
 // is far cheaper than the old per-page fetch fan-out.
 let _wikiData = null;
 let _wikiDataFetchedAt = 0;
+let _wikiDataInFlight = null;   // dedupes concurrent cold-start callers
 const WIKI_DATA_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 async function loadWikiData(force = false) {
     const now = Date.now();
     if (!force && _wikiData && (now - _wikiDataFetchedAt) < WIKI_DATA_TTL_MS) return _wikiData;
+
+    // getFreshKnowledge() resolves pages in parallel chunks, so on a cold cache
+    // several callers arrive at once. Without this guard they each fetch the
+    // full ~705 KB corpus. Share one request instead.
+    if (!force && _wikiDataInFlight) return _wikiDataInFlight;
+
+    _wikiDataInFlight = (async () => {
     try {
         const res = await axios.get(WIKI_DATA_URL, { timeout: 30000, validateStatus: s => s === 200 });
         const pages = res.data?.pages;
@@ -1599,7 +1607,11 @@ async function loadWikiData(force = false) {
     } catch (e) {
         console.warn(`⚠️ Wiki corpus fetch failed (${e.message}) — keeping previous copy if any.`);
         return _wikiData; // stale beats nothing; null means callers degrade to static knowledge
+    } finally {
+        _wikiDataInFlight = null;
     }
+    })();
+    return _wikiDataInFlight;
 }
 
 /** Look up one page from the cached corpus. Returns null if not loaded/found. */
