@@ -1631,6 +1631,44 @@ function wikiPageUrl(topic, langCode = 'EN-US') {
     return `https://wiki.punchymod.com/${lang}/${topic}`;
 }
 
+/**
+ * Build the "which page covers what" routing block for the wiki prompt.
+ *
+ * Generated from the live corpus, NEVER hardcoded. A hand-written map used to
+ * live in the prompt listing seven pages by their old titles ("Specific
+ * Animation & More Tuning System", "Punchy! Resource Pack Compatibility
+ * Guide", ...). None of those exist any more, and the six newer pages
+ * (Flags Reference, Pendulum Physics, Dynamic Bone Textures, Animation
+ * Effects Cheatsheet, Model Parts Variants, Animation Conditions) were absent
+ * from it entirely. So the model was told to route questions to pages it was
+ * never given, and given pages it was never told to use — which forces it to
+ * improvise, which is where fabricated answers come from.
+ *
+ * Deriving it from the same corpus the model receives keeps the two in sync by
+ * construction.
+ */
+function buildWikiRelevanceMap(langCode = 'EN-US') {
+    if (!_wikiData?.pages) return '(wiki corpus unavailable — do not guess at page contents)';
+
+    const lang = String(langCode).toLowerCase();
+    const pages = WIKI_PAGES
+        .map(topic => _wikiData.pages.find(p => p.id === `${lang}-${topic}`)
+                   || _wikiData.pages.find(p => p.id === `en-us-${topic}`))
+        .filter(Boolean);
+
+    return pages.map((p, i) => {
+        // First heading line of the body is a better "what's in here" signal
+        // than the generated summary, which is boilerplate for most pages.
+        const headings = (p.content || '')
+            .split(/\r?\n/)
+            .filter(l => /^#{2,3}\s+\S/.test(l))
+            .slice(0, 6)
+            .map(l => l.replace(/^#+\s*/, '').trim());
+        const covers = headings.length ? headings.join(' · ') : (p.summary || '');
+        return `${i + 1}. "${p.title}"  [${p.group || 'General'}]\n   COVERS: ${covers}`;
+    }).join('\n');
+}
+
 // ============================================================
 // PUNCHY 2.4+ STATIC FEATURE KNOWLEDGE
 // This is baked into every knowledge base fetch.
@@ -8477,46 +8515,24 @@ WIKI PAGE RELEVANCE MAP — READ THIS FIRST
 Each wiki page has a specific purpose. Only use pages that DIRECTLY match the question.
 ══════════════════════════════════════════════════
 
-1. "Specific Animation & More Tuning System"
-   USE FOR: customAnimation in tuning JSON, var_1/var_2 animation overrides, attack animation variants (sword_attack_1 etc.), per-item animation assignment, tuning system JSON structure, kind/specific/global scopes in tuning files.
-   IGNORE FOR: model parts, geometry, particles, bucket creatures, positioning.
+${buildWikiRelevanceMap(detectedLang)}
 
-2. "Punchy! Resource Pack Compatibility Guide"
-   USE FOR: ONLY when the user is a resource pack DEVELOPER asking how to write/edit compat JSON files for their pack (paths under assets/minecraft/punchy/compat/, JSON structure with item/itemSpecific/transforms/armTransforms, customGroups, armMesh, physics fields).
-   NEVER USE FOR: a regular user reporting that their arm/item position looks wrong — that user wants F8 ▸ Hand Positioner, NOT a JSON guide. Linking a regular player to this guide is a bad answer.
-   NEVER USE FOR: a user asking "how do I move my item" / "the position is off" / "how do I fix arm position" — those are F8 ▸ Hand Positioner answers.
-   How to tell if someone is a creator: they say "I'm making a resource pack", "in my pack", "compat file", "JSON", or talk about applying the same fix across many items. Otherwise assume regular player.
-   IGNORE FOR: animation logic, model geometry, tuning JSON internals.
-
-3. "Model Parts Bedrock Items System API"
-   USE FOR: custom geo/model for held items using Bedrock format, .geo.json files for items, rendering custom 3D item models in first person via Punchy's Bedrock item system.
-   IGNORE FOR: player arm animations, attack animations, tuning system, var_1 overrides, anything that isn't specifically about custom 3D item geometry rendering.
-
-4. "Model Parts Particle System"
-   USE FOR: adding particles to animations, particle events in animation JSON, particle triggers.
-   IGNORE FOR: everything else.
-
-5. "Punchy! Mod Debug Position"
-   USE FOR: the /punchy debug position command and its output format, exporting position data for resource pack creators.
-   NOTE: This is a CREATOR tool. Direct normal players to F8 ▸ Hand Positioner instead.
-   IGNORE FOR: everything else.
-
-6. "Punchy! Resource Pack Models and Geo Mapping"
-   USE FOR: mapping custom geo models to items/entities in resource packs, geo JSON structure for Punchy.
-   IGNORE FOR: animation logic, tuning system, particles.
-
-7. "Bucket Creatures Physics Wiki Model Parts"
-   USE FOR: physics-based animations for bucket creatures (axolotls, fish etc.), model parts specific to those entities.
-   IGNORE FOR: player animations, items, general tuning.
-
-══════════════════════════════════════════════════
+═══
 STRICT RULES FOR USING WIKI PAGES:
-- ONLY reference pages whose USE FOR description matches the user's question
-- If the user asks about var_1 / customAnimation / attack variants → use page 1 ONLY
-- If the user asks about item rendering with custom 3D geo → use page 3 ONLY  
-- NEVER mention the Bedrock Items System API unless the user is specifically asking about custom geo/3D item models
-- If no wiki page directly applies, answer from your general mod knowledge
-- Do NOT reference multiple pages when one is enough
+- ONLY reference pages whose COVERS description matches the user's question.
+- Do NOT reference multiple pages when one is enough.
+- Route positioning complaints from ORDINARY PLAYERS ("my item looks wrong",
+  "how do I move my hand") to F8 ▸ Hand Positioner. The compat/JSON pages are for
+  CREATORS — people who say "in my pack", "compat file", "I'm making a resource
+  pack", or who want one change applied across many items. Sending a normal
+  player to a JSON guide is a bad answer.
+- IF NO WIKI PAGE COVERS THE QUESTION, SAY SO AND ESCALATE.
+  Do NOT fall back on general knowledge of Minecraft modding to fill the gap.
+  This instruction used to read "answer from your general mod knowledge", and
+  that is exactly how a creator was told to stop the bow draw by overriding
+  "type": "useItem" — real field, real ToolKind, real path, wrong answer, and
+  the mod author had to step in and say "you cant". The wiki text above is your
+  ONLY source for how this mod behaves. Outside it you do not know.
 ══════════════════════════════════════════════════
 
 WIKI KNOWLEDGE (complete content of all pages — read all of it, then identify what's relevant):
@@ -8532,9 +8548,16 @@ ${wikiLinks}
 HOW TO ANSWER:
 1. Identify which 1-2 wiki pages (if any) are relevant using the relevance map above
 2. Answer the question directly in your own words — don't copy-paste wiki text
-3. Give concrete examples with real JSON if applicable
+3. JSON: only reproduce a structure the wiki text above actually demonstrates for
+   that purpose. Do NOT assemble one from field names you saw elsewhere in the
+   docs — every field can be real and the resulting config still wrong, which is
+   precisely how the bow answer failed. If the wiki does not show a config doing
+   the job the user wants, say that instead of composing one.
 4. Only link to wiki pages you actually referenced in your answer
 5. Be concise — don't dump full wiki sections
+6. If the answer isn't in the wiki text above, say "the wiki doesn't document
+   this" and escalate. That is a correct, useful answer — a plausible invention
+   is not.
 
 FORMATTING:
 - JSON code blocks: use \`\`\`json with proper indentation
@@ -9701,15 +9724,15 @@ LATEST MESSAGE: ${fullMessage}
 ══════════════════════════════════════════════════
 WIKI PAGE RELEVANCE MAP — USE THIS TO DECIDE WHICH PAGES APPLY
 ══════════════════════════════════════════════════
-1. "Specific Animation & More Tuning System" → var_1/var_2 overrides, customAnimation JSON, attack animation variants, per-item tuning
-2. "Punchy! Resource Pack Compatibility Guide" → ONLY for resource pack DEVELOPERS writing JSON compat files. Never link this for regular players reporting wrong arm/item position — those go to F8 ▸ Hand Positioner.
-3. "Model Parts Bedrock Items System API" → ONLY for custom 3D geo/model for held items. NOT for animations, NOT for var_1, NOT for tuning.
-4. "Model Parts Particle System" → particle events in animations only
-5. "Punchy! Mod Debug Position" → debug command for creators, NOT for normal players (tell them to use F8 ▸ Hand Positioner instead)
-6. "Punchy! Resource Pack Models and Geo Mapping" → mapping geo to items/entities in packs
-7. "Bucket Creatures Physics Wiki Model Parts" → bucket creature physics animations only
+${buildWikiRelevanceMap(detectedLang)}
 
-STRICT RULE: NEVER mention the Bedrock Items System API unless the user is explicitly asking about custom 3D item geometry/models. If they're asking about animations, var_1, tuning JSON, or attack variants — that's page 1, not page 3.
+STRICT RULES:
+- Route ordinary players reporting wrong arm/item position to F8 ▸ Hand Positioner.
+  The compat/JSON pages are for CREATORS writing resource packs, not for players.
+- If no page above covers the question, say the wiki doesn't document it and
+  escalate. Do NOT fall back on general Minecraft-modding knowledge to fill the
+  gap — that is how a creator got told to override "type": "useItem" to stop the
+  bow draw, which is wrong (bow charge is use_bow) and cost them their time.
 ══════════════════════════════════════════════════
 
 WIKI KNOWLEDGE (complete content of all pages — read all of it, then identify what's relevant):
