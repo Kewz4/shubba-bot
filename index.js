@@ -7615,20 +7615,66 @@ async function registerCommands() {
 
 // --- 5. HELPERS ---
 
-function splitMessage(text, limit = 1900) {
+/**
+ * Split a reply into Discord-sized chunks WITHOUT breaking code fences.
+ *
+ * The old version split on the nearest newline and ignored ``` fences, so any
+ * answer whose JSON block straddled the boundary produced a chunk ending in an
+ * unclosed fence — Discord then rendered the whole remainder as one broken code
+ * block. Shubba emits JSON constantly, so this fired often and looked like the
+ * bot "failing".
+ *
+ * Here a fence left open at a cut is closed on the way out and reopened (with
+ * its original language tag) on the way in, so every chunk is valid on its own.
+ */
+// Discord's hard cap is 2000 characters; a send over it is rejected outright.
+// The default here is deliberately well under that because several call sites
+// DECORATE chunks[0] after splitting — e.g.
+//   `📊 **Deep Technical Analysis Report**\n\n${chunks[0]}${versionWarning}`
+// A 1900-char chunk plus a header plus a version warning tipped past 2000 and
+// the message silently failed to send. 1750 leaves room for that decoration.
+function splitMessage(text, limit = 1750) {
     const chunks = [];
-    let current = text;
+    let current = String(text ?? '');
+    let carryFence = null; // e.g. '```json' when a block is still open
+
+    const fenceState = (s, startOpen) => {
+        // Returns the fence still open at the end of s, or null.
+        let open = startOpen;
+        for (const m of s.matchAll(/^[ \t]*```([A-Za-z0-9_+-]*)[ \t]*$/gm)) {
+            open = open ? null : '```' + (m[1] || '');
+        }
+        return open;
+    };
+
     while (current.length > 0) {
-        if (current.length <= limit) {
-            chunks.push(current);
+        const prefix = carryFence ? carryFence + '\n' : '';
+        const budget = limit - prefix.length - 4; // room to close a fence
+
+        if (prefix.length + current.length <= limit) {
+            chunks.push(prefix + current);
             break;
         }
-        let splitIndex = current.lastIndexOf('\n', limit);
-        if (splitIndex === -1) splitIndex = limit;
-        chunks.push(current.substring(0, splitIndex));
-        current = current.substring(splitIndex).trim();
+
+        let splitIndex = current.lastIndexOf('\n', budget);
+        // A single line longer than the budget: hard-cut at a space if we can.
+        if (splitIndex <= 0) {
+            splitIndex = current.lastIndexOf(' ', budget);
+            if (splitIndex <= 0) splitIndex = budget;
+        }
+
+        let piece = current.substring(0, splitIndex);
+        const stillOpen = fenceState(piece, carryFence);
+        if (stillOpen) piece += '\n```';          // close it here
+        chunks.push(prefix + piece);
+        carryFence = stillOpen;                    // and reopen in the next chunk
+
+        current = current.substring(splitIndex).replace(/^\n+/, '');
+        if (!current.trim()) break;
     }
-    return chunks;
+
+    // Discord rejects empty messages outright.
+    return chunks.filter(c => c.trim().length > 0);
 }
 
 async function analyzeAttachments(message, threadId) {
