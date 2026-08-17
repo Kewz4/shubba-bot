@@ -59,6 +59,9 @@ const http = require('http');
 const { createGeminiRunner, parseChain } = require('./lib/gemini-chain');
 const { PUNCHY_VERIFIED_KNOWLEDGE } = require('./lib/punchy-knowledge');
 const { GROUNDING_RULES, buildLanguageDirective } = require('./lib/answer-policy');
+// Structural patterns measured from working community compat packs. Teaches the
+// SHAPE of real configs only — never names a pack; see lib/pack-patterns.js.
+const { PACK_PATTERNS_KNOWLEDGE } = require('./lib/pack-patterns');
 const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -8561,6 +8564,8 @@ STRICT RULES FOR USING WIKI PAGES:
 WIKI KNOWLEDGE (complete content of all pages — read all of it, then identify what's relevant):
 ${freshKnowledge}
 
+${PACK_PATTERNS_KNOWLEDGE}
+
 PUNCHY MOD FEATURES:
 ${PUNCHY_STATIC_KNOWLEDGE}
 ${buildCustomKnowledge()}
@@ -9768,6 +9773,8 @@ STRICT RULES:
 
 WIKI KNOWLEDGE (complete content of all pages — read all of it, then identify what's relevant):
 ${freshWikiKnowledge}
+
+${PACK_PATTERNS_KNOWLEDGE}
 
 PUNCHY MOD FEATURES:
 ${PUNCHY_STATIC_KNOWLEDGE}
