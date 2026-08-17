@@ -1623,10 +1623,16 @@ function getWikiPageMeta(topic, langCode = 'EN-US') {
         || null;
 }
 
-/** Canonical, citable URL for a topic — never hand-build wiki URLs elsewhere. */
+/**
+ * Canonical, citable URL for a topic — never hand-build wiki URLs elsewhere.
+ *
+ * Deliberately does NOT use the corpus's own `url` field: that points at
+ * github.com/punchy-guys/punchy-wiki/wiki/<numbered-slug>, which (a) is not the
+ * site we want users on and (b) 404s for anonymous visitors. Verified
+ * 2026-08-17: https://wiki.punchymod.com/<lang>/<topic> returns 200 for every
+ * topic in WIKI_PAGES, so the topic key IS the public route.
+ */
 function wikiPageUrl(topic, langCode = 'EN-US') {
-    const meta = getWikiPageMeta(topic, langCode);
-    if (meta?.url) return meta.url;
     const lang = String(langCode).toLowerCase();
     return `https://wiki.punchymod.com/${lang}/${topic}`;
 }
@@ -1779,19 +1785,36 @@ CONFIG OPTIONS (full list, all toggleable):
 
 F8 — UNIFIED PUNCHY MENU (single keybind for everything):
 - Press F8 in-game to open the Punchy! main menu — this is the central hub for ALL Punchy features
-- F8 is also how the Tuning Workbench is reached (via a button in the menu), replacing the old F8/F9 split for the positioner.
-- F9 still EXISTS as the Tuning Workbench control key (it closes the Workbench in current builds) — it is simply not how players open the positioner any more.
+- Everything is under F8: mod settings, blacklist, Mix Pack selection, AND the Hand Positioner
+- The Tuning Workbench is ALSO reachable from a button in this menu, but it is a
+  SEPARATE, CREATOR-ONLY tool. See the hard separation below.
+- F9 still EXISTS as the Tuning Workbench control key (it closes the Workbench in current builds).
 - ⚠️ F9 COLLISION: Better Fishing's "options" keybind ALSO defaults to F9. If a user has both mods installed and F9 "does the wrong thing", that is the conflict — have them rebind one in Options ▸ Controls.
-- Everything is now under F8: mod settings, blacklist, Mix Pack selection, AND the Hand Positioner
+
+⛔ HAND POSITIONER vs TUNING WORKBENCH — DO NOT BLEND THESE. THEY ARE DIFFERENT TOOLS.
+This is a real, repeated mistake: Shubba has told ordinary players to "enable
+tuning" or go through tuning/dev mode before using the Hand Positioner. That is
+WRONG and it makes a two-click GUI fix sound like a developer workflow.
+- The Hand Positioner is a PLAIN GUI for PLAYERS. It is standalone. There is NO
+  tuning mode, dev mode, or any other toggle to switch on first. F8, click
+  "Hand Positioner", drag sliders, Save. That is the entire procedure.
+- The Tuning Workbench / tuning dev mode is the RESOURCE-PACK-CREATOR workflow.
+  It exists to author pack files. A player fixing how their sword sits in their
+  own hand never needs to touch it, never needs to hear the word "tuning", and
+  never needs a JSON file.
+- Never describe the Hand Positioner as part of, gated behind, or reached through
+  the Tuning Workbench. Never mix GUI steps and file/JSON/command steps in one
+  set of instructions — decide first whether you are talking to a player or a
+  creator, then give only that path.
 
 F8 ▸ HAND POSITIONER (the player tool for fixing arm/item positions):
-- Inside the F8 menu there is a "Hand Positioner" entry
+- Inside the F8 menu there is a "Hand Positioner" entry — click it. Nothing to enable first.
 - Opens a live in-game positioner with sliders + a real-time preview of the change
 - Sliders cover: offX/offY/offZ (position), rotX/rotY/rotZ (rotation), scale, pivot points
 - Per-hand editing: Main hand and Off hand selectable
 - Scope: Global, Kind (item category), or Specific (one exact item)
-- Save button persists the tuning to the user's local config — no commands needed
-- Mirror Hand button copies tuning to the opposite hand
+- Save button writes it to the player's own local config — no commands, no files, no pack
+- Mirror Hand button copies the settings to the opposite hand
 - This is the answer to ALL "my arm/item position looks wrong" questions for regular players
 
 F8 ▸ BLACKLIST MENU:
@@ -1808,8 +1831,9 @@ NEVER tell a user to install GeckoLib. It is NOT required and NOT bundled — on
 The INSERT / PAGE UP / HOME / PAGE DOWN / END "debug position" keybinds do NOT exist in current builds. The old GitHub wiki page documenting them is stale and has been removed from ingestion — never repeat its contents.
 
 RESOURCE PACK CREATORS / DEVELOPERS — DIFFERENT WORKFLOW:
-Pack creators who want bulk JSON-based tuning across many items use the Resource Pack Compatibility Guide:
-https://github.com/punchy-guys/punchy-wiki/wiki/Punchy!-Resource-Pack-Compatibility-Guide-EN-US
+Pack creators who want bulk JSON-based tuning across many items use the Compat Pack Reference:
+https://wiki.punchymod.com/en-us/compat
+(NEVER link github.com for the wiki — that repo is not publicly readable and every link into it 404s.)
 
 Pack creator workflow (DO NOT mention this to regular players):
 - Compat files live at: assets/minecraft/punchy/compat/<any_name>.json inside the resource pack
@@ -2848,7 +2872,7 @@ const DEFAULT_FAQ_EMBEDS = [
     {
         id: "resource_pack",
         title: "🎨 My Resource Pack isn't working with the mod?",
-        description: `We have added workarounds to ensure **most** resource packs work automatically, but some issues may persist.\n\n**Dev fix:** Add explicit compatibility — see our wiki → <${WIKI_LINK}>\n*(Compatibility Guide mirror, until the new wiki finishes syncing: <https://github.com/punchy-guys/punchy-wiki/wiki/Punchy!-Resource-Pack-Compatibility-Guide-EN-US>)*\n\nPress **F8** → **Hand Positioner** to access the brand-new live position editor with sliders.\n\n**Quick fix via Config (also under F8):**\n• **Single item:** Add the specific ID (e.g. \`examplemod:item_name\`)\n• **Whole mod:** Add the mod ID (e.g. \`examplemod\`) to disable Punchy rendering for all its items\n*This reverts those items to standard vanilla rendering.*\n\nFor questions about documentation or custom animations, ask in <#${WIKI_FORUM_ID}>.`
+        description: `We have added workarounds to ensure **most** resource packs work automatically, but some issues may persist.\n\n**Dev fix (resource pack creators):** Add explicit compatibility — see the Compat Pack Reference → <https://wiki.punchymod.com/en-us/compat>\n\n**Just want your item to sit right? (most people)** Press **F8** → **Hand Positioner** — live sliders with a real-time preview. Nothing to enable first, no files to edit.\n\n**Quick fix via Config (also under F8):**\n• **Single item:** Add the specific ID (e.g. \`examplemod:item_name\`)\n• **Whole mod:** Add the mod ID (e.g. \`examplemod\`) to disable Punchy rendering for all its items\n*This reverts those items to standard vanilla rendering.*\n\nFor questions about documentation or custom animations, ask in <#${WIKI_FORUM_ID}>.`
     },
     {
         id: "packs",
@@ -5460,12 +5484,11 @@ function detectLanguage(text) {
 }
 
 /**
- * Get Discord markdown hyperlink
- * Wiki URL format: https://github.com/punchy-guys/punchy-wiki/wiki/PageName-LANG-CODE
+ * Discord-safe wiki hyperlink. Always wiki.punchymod.com — the GitHub wiki is
+ * not publicly readable and every link into it 404s for users.
  */
 function getWikiLink(pageName, langCode) {
-    const url = `https://github.com/punchy-guys/punchy-wiki/wiki/${pageName}-${langCode}`;
-    return `<${url}>`; // Use angle brackets to suppress Discord embeds
+    return `<${wikiPageUrl(pageName, langCode)}>`; // angle brackets suppress embeds
 }
 
 // State Tracking
@@ -8542,7 +8565,12 @@ PUNCHY MOD FEATURES:
 ${PUNCHY_STATIC_KNOWLEDGE}
 ${buildCustomKnowledge()}
 
-AVAILABLE WIKI PAGES (only link pages you actually used — use <angle brackets> to prevent Discord embeds):
+AVAILABLE WIKI PAGES — COPY THESE URLS VERBATIM.
+Never construct a wiki URL yourself, and never link github.com. If a page you
+want is not in this list, do not link anything. Shubba has posted invented links
+like <https://github.com/punchy-guys/punchy-wiki/wiki/animation-EN-US>, which is
+a 404 — the user clicks it, gets nothing, and trusts the answer less.
+Only link pages you actually used. Wrap every URL in <angle brackets>:
 ${wikiLinks}
 
 HOW TO ANSWER:
@@ -9704,8 +9732,11 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             const freshWikiKnowledge = await getFreshKnowledge(true, detectedLang);
             
             const wikiLinks = WIKI_PAGES.map(page => {
-                const url = `https://github.com/punchy-guys/punchy-wiki/wiki/${page}-${detectedLang}`;
-                return `${page.replace(/-/g, ' ')}: <${url}>`;
+                // Was `github.com/.../${page}-${detectedLang}` — which produced
+                // dead links like .../animation-EN-US (404). Always go through
+                // wikiPageUrl so users land on wiki.punchymod.com.
+                const meta = getWikiPageMeta(page, detectedLang);
+                return `${meta?.title || page.replace(/-/g, ' ')}: <${wikiPageUrl(page, detectedLang)}>`;
             }).join('\n');
             
             const wikiPrompt = `You are Shubba, a knowledgeable wiki expert for the Punchy! Minecraft mod. Continue this conversation naturally.
@@ -9742,7 +9773,9 @@ PUNCHY MOD FEATURES:
 ${PUNCHY_STATIC_KNOWLEDGE}
 ${buildCustomKnowledge()}
 
-AVAILABLE WIKI PAGES (only link pages you actually used — <angle brackets> to suppress embeds):
+AVAILABLE WIKI PAGES — COPY THESE URLS VERBATIM. Never construct a wiki URL
+yourself and never link github.com; invented slugs 404. If the page you want is
+not listed, link nothing. Only link pages you used. Use <angle brackets>:
 ${wikiLinks}
 
 INSTRUCTIONS:

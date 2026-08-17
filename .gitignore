@@ -6,3 +6,4 @@ shubba-files/
 *.log
 package-lock.json
 .claude/worktrees/
+forum-backup/
