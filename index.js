@@ -65,6 +65,8 @@ const { PACK_PATTERNS_KNOWLEDGE } = require('./lib/pack-patterns');
 // Single definition of the wiki-answer prompt, shared by the Discord path
 // and the /api/knowledge/test-wiki replay harness so they cannot drift.
 const { buildWikiAnswerPrompt } = require('./lib/wiki-prompt');
+// Message shaping (fence-aware splitting + the embed house style).
+const { splitMessage, answerEmbeds, noticeEmbed, COLORS } = require('./lib/discord-format');
 const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7627,55 +7629,7 @@ async function registerCommands() {
  * Here a fence left open at a cut is closed on the way out and reopened (with
  * its original language tag) on the way in, so every chunk is valid on its own.
  */
-// Discord's hard cap is 2000 characters; a send over it is rejected outright.
-// The default here is deliberately well under that because several call sites
-// DECORATE chunks[0] after splitting — e.g.
-//   `📊 **Deep Technical Analysis Report**\n\n${chunks[0]}${versionWarning}`
-// A 1900-char chunk plus a header plus a version warning tipped past 2000 and
-// the message silently failed to send. 1750 leaves room for that decoration.
-function splitMessage(text, limit = 1750) {
-    const chunks = [];
-    let current = String(text ?? '');
-    let carryFence = null; // e.g. '```json' when a block is still open
 
-    const fenceState = (s, startOpen) => {
-        // Returns the fence still open at the end of s, or null.
-        let open = startOpen;
-        for (const m of s.matchAll(/^[ \t]*```([A-Za-z0-9_+-]*)[ \t]*$/gm)) {
-            open = open ? null : '```' + (m[1] || '');
-        }
-        return open;
-    };
-
-    while (current.length > 0) {
-        const prefix = carryFence ? carryFence + '\n' : '';
-        const budget = limit - prefix.length - 4; // room to close a fence
-
-        if (prefix.length + current.length <= limit) {
-            chunks.push(prefix + current);
-            break;
-        }
-
-        let splitIndex = current.lastIndexOf('\n', budget);
-        // A single line longer than the budget: hard-cut at a space if we can.
-        if (splitIndex <= 0) {
-            splitIndex = current.lastIndexOf(' ', budget);
-            if (splitIndex <= 0) splitIndex = budget;
-        }
-
-        let piece = current.substring(0, splitIndex);
-        const stillOpen = fenceState(piece, carryFence);
-        if (stillOpen) piece += '\n```';          // close it here
-        chunks.push(prefix + piece);
-        carryFence = stillOpen;                    // and reopen in the next chunk
-
-        current = current.substring(splitIndex).replace(/^\n+/, '');
-        if (!current.trim()) break;
-    }
-
-    // Discord rejects empty messages outright.
-    return chunks.filter(c => c.trim().length > 0);
-}
 
 async function analyzeAttachments(message, threadId) {
     let details = "";
@@ -7843,7 +7797,17 @@ async function requestHumanHelp(thread, reason) {
         const pings = DEV_IDS.map(id => `<@${id}>`).join(' ');
         const isWikiForum = thread.parentId === WIKI_FORUM_ID;
         const helpType = isWikiForum ? "Wiki question needs human help" : "Support issue needs human help";
-        await thread.send({ content: `🚩 **Human Help Requested!**\n${helpType}\nReason: ${reason}\n\nAttention: ${pings}\n\nI'll step aside for a human moderator. I won't reply anymore unless tagged!` });
+        // Red embed: an escalation should be visually distinct from an answer at
+        // a glance, so moderators scanning a busy forum spot it immediately.
+        await thread.send({
+            content: pings, // pings must be in content to actually notify
+            embeds: [noticeEmbed({
+                title: '🚩 Human help requested',
+                description: `${helpType}\n**Reason:** ${reason}`,
+                color: COLORS.ESCALATE,
+                footer: "Shubba has stepped aside and won't reply again unless tagged.",
+            })],
+        });
     } catch (e) { console.error("Failed to flag thread:", e); }
 }
 
@@ -7892,24 +7856,32 @@ async function solveThread(thread, interactionOrMessage) {
         
         const cleanName = thread.name.replace('(HUMAN HELP) ', '').replace('[SOLVED] ', '');
         const newName = await safeThreadName('[SOLVED] ', cleanName);
-        const msg = isWikiForum 
-            ? "✅ **Answered!** This wiki question is now being locked and archived. If you have more questions, please create a new post!"
-            : "✅ **Solved!** This thread is now being locked and archived. If you need further assistance, please create a new post!";
-        
+        // Green embed — matches the red escalation embed so thread state is
+        // readable from the colour alone when scrolling a busy forum.
+        const payload = {
+            embeds: [noticeEmbed({
+                title: isWikiForum ? '✅ Answered' : '✅ Solved',
+                description: isWikiForum
+                    ? 'This wiki question is now locked and archived.\nGot another one? Open a new post.'
+                    : 'This thread is now locked and archived.\nNeed more help? Open a new post.',
+                color: COLORS.SOLVED,
+            })],
+        };
+
         if (interactionOrMessage.editReply) {
             try {
-                await interactionOrMessage.editReply({ content: msg });
+                await interactionOrMessage.editReply(payload);
             } catch (e) {
-                await thread.send({ content: msg }).catch(() => {});
+                await thread.send(payload).catch(() => {});
             }
         } else if (interactionOrMessage.reply && !interactionOrMessage.author) {
             try {
-                await interactionOrMessage.reply({ content: msg });
+                await interactionOrMessage.reply(payload);
             } catch (e) {
-                await thread.send({ content: msg }).catch(() => {});
+                await thread.send(payload).catch(() => {});
             }
         } else {
-            await thread.send({ content: msg }).catch(() => {});
+            await thread.send(payload).catch(() => {});
         }
 
         // Rename — try/catch independently so lock/archive still run even if rename fails
@@ -8675,23 +8647,25 @@ client.on(Events.ThreadCreate, async (thread) => {
         addToThreadMemory(thread.id, client.user.username, fixedAnswer, true);
         
         const chunks = splitMessage(fixedAnswer);
+        // Answers go out as embeds: a plain message caps at 2000 characters, so
+        // a normal reply used to arrive as 2-3 separate messages. An embed
+        // description holds 4096, so almost everything now lands as ONE message
+        // with a coloured spine and the citation in its own footer.
         const langFlag = detectedLang === 'EN-US' ? '📚' : `🌐 ${langInfo.nativeName}`;
-        const firstChunk = `${langFlag} **Wiki Help**\n\n${chunks[0]}`;
-        
-        await thread.send({ content: firstChunk });
-        
-        for (let i = 1; i < chunks.length - 1; i++) {
-            await thread.send(chunks[i]);
-        }
-        
-        if (chunks.length > 1) {
-            await thread.send({ content: chunks[chunks.length - 1], components: [getSupportButtons()] });
-        } else {
-            const messages = await thread.messages.fetch({ limit: 1 });
-            const lastMsg = messages.first();
-            if (lastMsg && lastMsg.author.id === client.user.id) {
-                await lastMsg.edit({ components: [getSupportButtons()] }).catch(() => {});
-            }
+        const embeds = answerEmbeds(fixedAnswer, {
+            title: `${langFlag} Wiki Help`,
+            color: COLORS.ANSWER,
+            footer: 'Punchy! Wiki · react 👎 if this missed the mark',
+        });
+
+        // Discord allows up to 10 embeds per message; batch so buttons land on
+        // the final one regardless of how many parts there are.
+        for (let i = 0; i < embeds.length; i += 10) {
+            const batch = embeds.slice(i, i + 10);
+            const isLast = i + 10 >= embeds.length;
+            await thread.send(isLast
+                ? { embeds: batch, components: [getSupportButtons()] }
+                : { embeds: batch });
         }
         
       } catch (error) { 
