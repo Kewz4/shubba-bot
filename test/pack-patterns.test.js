@@ -89,9 +89,17 @@ test('warns about the case-sensitivity footgun found in shipping packs', () => {
     assert.match(K, /"ITEM"/);
 });
 
-test('is injected into the wiki prompts, not just defined', () => {
+test('reaches the wiki prompt, via the one shared builder', () => {
+    // The prompt lives in lib/wiki-prompt.js and both Discord paths call it, so
+    // the pack knowledge is injected once and cannot drift between them.
+    const promptSrc = fs.readFileSync(path.join(__dirname, '..', 'lib', 'wiki-prompt.js'), 'utf8');
+    assert.match(promptSrc, /require\('\.\/pack-patterns'\)/, 'prompt does not import pack patterns');
+    assert.match(promptSrc, /\$\{PACK_PATTERNS_KNOWLEDGE\}/, 'prompt does not interpolate it');
+
     const idx = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
-    assert.match(idx, /require\('\.\/lib\/pack-patterns'\)/, 'module not required');
-    const uses = (idx.match(/\$\{PACK_PATTERNS_KNOWLEDGE\}/g) || []).length;
-    assert.ok(uses >= 2, `expected both wiki prompts to include it, found ${uses}`);
+    const calls = (idx.match(/buildWikiAnswerPrompt\(\{/g) || []).length;
+    assert.ok(calls >= 2, `expected both wiki paths to call the builder, found ${calls}`);
+    // No path may hand-roll its own copy of the prompt.
+    assert.doesNotMatch(idx, /const wikiPrompt = `You are Shubba/,
+        'an inline wiki prompt reappeared — it will drift from the shared one');
 });

@@ -62,6 +62,9 @@ const { GROUNDING_RULES, buildLanguageDirective } = require('./lib/answer-policy
 // Structural patterns measured from working community compat packs. Teaches the
 // SHAPE of real configs only — never names a pack; see lib/pack-patterns.js.
 const { PACK_PATTERNS_KNOWLEDGE } = require('./lib/pack-patterns');
+// Single definition of the wiki-answer prompt, shared by the Discord path
+// and the /api/knowledge/test-wiki replay harness so they cannot drift.
+const { buildWikiAnswerPrompt } = require('./lib/wiki-prompt');
 const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -492,6 +495,49 @@ const dashboardServer = http.createServer(async (req, res) => {
                 const answer = await callGemini(prompt, false);
                 return sendJSON(res, { answer });
             } catch(e) { return sendJSON(res, { answer: 'Error: ' + e.message }); }
+        }
+
+        // POST /api/knowledge/test-wiki — replay harness.
+        //
+        // Runs a question through the REAL wiki-answer path: same prompt builder
+        // (lib/wiki-prompt.js), same ingested corpus, same model chain, same
+        // post-processing as a forum thread. Nothing is posted to Discord.
+        //
+        // Exists so "did the answers actually improve?" can be measured against
+        // known-bad historical questions instead of argued about.
+        if (path === '/api/knowledge/test-wiki' && req.method === 'POST') {
+            const { question, lang, threadName, conversationContext } = parsed;
+            if (!question) return sendJSON(res, { error: 'question required' }, 400);
+            try {
+                const detectedLang = lang || detectLanguage(question);
+                const langInfo = SUPPORTED_LANGUAGES[detectedLang] || SUPPORTED_LANGUAGES['EN-US'];
+                const freshKnowledge = await getFreshKnowledge(false, detectedLang);
+                const wikiLinks = WIKI_PAGES.map(page => {
+                    const meta = getWikiPageMeta(page, detectedLang);
+                    return `${meta?.title || page.replace(/-/g, ' ')}: <${wikiPageUrl(page, detectedLang)}>`;
+                }).join('\n');
+
+                const prompt = buildWikiAnswerPrompt({
+                    question,
+                    threadName: threadName || 'replay harness',
+                    langInfo,
+                    relevanceMap: buildWikiRelevanceMap(detectedLang),
+                    wikiLinks,
+                    freshKnowledge,
+                    staticKnowledge: PUNCHY_STATIC_KNOWLEDGE,
+                    customKnowledge: buildCustomKnowledge(),
+                    conversationContext: conversationContext || '',
+                });
+
+                const raw = await callGeminiWiki(prompt);
+                const answer = qualityCheckResponse(raw, detectedLang);
+                return sendJSON(res, {
+                    answer,
+                    detectedLang,
+                    promptChars: prompt.length,
+                    wikiChars: (freshKnowledge || '').length,
+                });
+            } catch(e) { return sendJSON(res, { error: String(e.message) }, 500); }
         }
 
         // GET /api/faq
@@ -5457,33 +5503,70 @@ function detectLanguage(text) {
         return 'RU-RU';
     }
     
-    // Check for common words in other languages
+    // Keyword scoring for Latin-script languages.
+    //
+    // ⚠️ English MUST be scored as a competitor. It previously wasn't — it was
+    // only the fallback when nothing else matched — so any English sentence
+    // containing a word that also appears in another list won outright.
+    // "how do I do sword smear frames?" scored 2 for Portuguese (\bdo\b twice)
+    // and 0 for English, and a plain English question got answered in Portuguese.
+    //
+    // Single-letter tokens (o, e, y, a) are deliberately excluded: they carry
+    // almost no signal and collide constantly.
     const languageKeywords = {
-        'DE-DE': ['der', 'die', 'das', 'und', 'ich', 'ist', 'nicht', 'haben', 'werden', 'können', 'mein', 'fehler', 'problem', 'hilfe'],
-        'ES-ES': ['el', 'la', 'de', 'que', 'y', 'es', 'no', 'un', 'por', 'con', 'mi', 'error', 'problema', 'ayuda'],
-        'FR-FR': ['le', 'de', 'un', 'et', 'être', 'avoir', 'que', 'pour', 'dans', 'ce', 'mon', 'erreur', 'problème', 'aide'],
-        'PT-BR': ['o', 'de', 'que', 'e', 'do', 'da', 'em', 'um', 'para', 'com', 'não', 'meu', 'erro', 'problema', 'ajuda']
+        'EN-US': ['the', 'and', 'is', 'are', 'you', 'your', 'to', 'it', 'my', 'not', 'can', 'how',
+                  'do', 'does', 'with', 'have', 'this', 'that', 'for', 'in', 'on', 'of', 'me',
+                  'help', 'error', 'problem', 'animation', 'mod', 'but', 'when', 'why', 'what',
+                  'there', 'still', 'work', 'works', 'working', 'fix', 'know', 'want', 'make'],
+        'DE-DE': ['der', 'die', 'das', 'und', 'ich', 'ist', 'nicht', 'haben', 'werden', 'können',
+                  'mein', 'fehler', 'hilfe', 'wie', 'kann', 'machen', 'aber', 'auch', 'funktioniert', 'bitte'],
+        'ES-ES': ['el', 'la', 'que', 'es', 'no', 'un', 'por', 'con', 'mi', 'pero', 'problema', 'ayuda',
+                  'dónde', 'puedo', 'cómo', 'qué', 'sobre', 'errores', 'hacer', 'tengo', 'está',
+                  'más', 'también', 'funciona', 'gracias', 'una', 'los', 'las'],
+        'FR-FR': ['le', 'un', 'et', 'être', 'avoir', 'que', 'pour', 'dans', 'ce', 'mon', 'erreur',
+                  'problème', 'aide', 'où', 'comment', 'puis', 'faire', 'avec', 'mais', 'aussi',
+                  'fonctionne', 'merci', 'les', 'des'],
+        'PT-BR': ['de', 'que', 'do', 'da', 'em', 'um', 'para', 'com', 'não', 'meu', 'erro', 'ajuda',
+                  'onde', 'posso', 'como', 'sobre', 'erros', 'fazer', 'tenho', 'está', 'mais',
+                  'também', 'funciona', 'obrigado', 'você', 'uma', 'dos']
     };
-    
-    let maxScore = 0;
-    let detectedLang = 'EN-US';
-    
-    Object.entries(languageKeywords).forEach(([lang, keywords]) => {
+
+    // Diacritics and punctuation that effectively only occur in one language.
+    // Worth several keywords each — "¿dónde?" is unambiguous where "como" is not.
+    const strongMarkers = [
+        [/[¿¡ñ]/, 'ES-ES'],
+        [/[ãõ]/, 'PT-BR'],
+        [/[ß]|[äöü]/, 'DE-DE'],
+        [/[œàèùêâôî]/, 'FR-FR'],
+    ];
+
+    const scores = {};
+    for (const [lang, keywords] of Object.entries(languageKeywords)) {
         let score = 0;
-        keywords.forEach(keyword => {
-            const regex = new RegExp(`\\b${keyword}\\b`, 'gi');
-            const matches = textLower.match(regex);
+        for (const keyword of keywords) {
+            const matches = textLower.match(new RegExp(`\\b${keyword}\\b`, 'gi'));
             if (matches) score += matches.length;
-        });
-        
-        if (score > maxScore) {
-            maxScore = score;
-            detectedLang = lang;
         }
-    });
-    
-    // If score is too low, default to English
-    return maxScore >= 2 ? detectedLang : 'EN-US';
+        scores[lang] = score;
+    }
+
+    // Diacritic evidence is strong; weight it above ordinary keyword hits.
+    for (const [re, lang] of strongMarkers) {
+        const hits = (text.match(new RegExp(re.source, 'gi')) || []).length;
+        if (hits) scores[lang] += 2 + hits;
+    }
+
+    const enScore = scores['EN-US'];
+    let detectedLang = 'EN-US';
+    let maxScore = enScore;
+    for (const [lang, score] of Object.entries(scores)) {
+        if (lang !== 'EN-US' && score > maxScore) { maxScore = score; detectedLang = lang; }
+    }
+
+    // A non-English guess must BEAT English outright and clear the noise floor.
+    // Ties go to English: shared tokens ("do", "como") are evidence of nothing.
+    if (detectedLang !== 'EN-US' && (maxScore <= enScore || maxScore < 2)) return 'EN-US';
+    return detectedLang;
 }
 
 /**
@@ -8527,91 +8610,16 @@ client.on(Events.ThreadCreate, async (thread) => {
             return `${meta?.title || page.replace(/-/g, ' ')}: <${wikiPageUrl(page, detectedLang)}>`;
         }).join('\n');
         
-        const wikiPrompt = `You are Shubba, a knowledgeable wiki expert for the Punchy! Minecraft mod. You've READ and UNDERSTOOD the entire wiki.
-
-${GROUNDING_RULES}
-
-${buildLanguageDirective(langInfo)}
-
-USER'S QUESTION: ${starter.content}
-THREAD CONTEXT: "${thread.name}"
-
-══════════════════════════════════════════════════
-WIKI PAGE RELEVANCE MAP — READ THIS FIRST
-Each wiki page has a specific purpose. Only use pages that DIRECTLY match the question.
-══════════════════════════════════════════════════
-
-${buildWikiRelevanceMap(detectedLang)}
-
-═══
-STRICT RULES FOR USING WIKI PAGES:
-- ONLY reference pages whose COVERS description matches the user's question.
-- Do NOT reference multiple pages when one is enough.
-- Route positioning complaints from ORDINARY PLAYERS ("my item looks wrong",
-  "how do I move my hand") to F8 ▸ Hand Positioner. The compat/JSON pages are for
-  CREATORS — people who say "in my pack", "compat file", "I'm making a resource
-  pack", or who want one change applied across many items. Sending a normal
-  player to a JSON guide is a bad answer.
-- IF NO WIKI PAGE COVERS THE QUESTION, SAY SO AND ESCALATE.
-  Do NOT fall back on general knowledge of Minecraft modding to fill the gap.
-  This instruction used to read "answer from your general mod knowledge", and
-  that is exactly how a creator was told to stop the bow draw by overriding
-  "type": "useItem" — real field, real ToolKind, real path, wrong answer, and
-  the mod author had to step in and say "you cant". The wiki text above is your
-  ONLY source for how this mod behaves. Outside it you do not know.
-══════════════════════════════════════════════════
-
-WIKI KNOWLEDGE (complete content of all pages — read all of it, then identify what's relevant):
-${freshKnowledge}
-
-${PACK_PATTERNS_KNOWLEDGE}
-
-PUNCHY MOD FEATURES:
-${PUNCHY_STATIC_KNOWLEDGE}
-${buildCustomKnowledge()}
-
-AVAILABLE WIKI PAGES — COPY THESE URLS VERBATIM.
-Never construct a wiki URL yourself, and never link github.com. If a page you
-want is not in this list, do not link anything. Shubba has posted invented links
-like <https://github.com/punchy-guys/punchy-wiki/wiki/animation-EN-US>, which is
-a 404 — the user clicks it, gets nothing, and trusts the answer less.
-Only link pages you actually used. Wrap every URL in <angle brackets>:
-${wikiLinks}
-
-HOW TO ANSWER:
-1. Identify which 1-2 wiki pages (if any) are relevant using the relevance map above
-2. Answer the question directly in your own words — don't copy-paste wiki text
-3. JSON: only reproduce a structure the wiki text above actually demonstrates for
-   that purpose. Do NOT assemble one from field names you saw elsewhere in the
-   docs — every field can be real and the resulting config still wrong, which is
-   precisely how the bow answer failed. If the wiki does not show a config doing
-   the job the user wants, say that instead of composing one.
-4. Only link to wiki pages you actually referenced in your answer
-5. Be concise — don't dump full wiki sections
-6. If the answer isn't in the wiki text above, say "the wiki doesn't document
-   this" and escalate. That is a correct, useful answer — a plausible invention
-   is not.
-
-FORMATTING:
-- JSON code blocks: use \`\`\`json with proper indentation
-- Wiki links: "Page Name: <URL>" not "[Page Name](<URL>)"
-- Suppress Discord embeds: always wrap URLs in <angle brackets>
-
-Example GOOD JSON format:
-\`\`\`json
-{
-  "itemSpecific": {
-    "minecraft:diamond_sword": {
-      "customAnimation": [
-        {
-          "type": "attack",
-          "var_1": "sword_attack_1"
-        }
-      ]
-    }
-  }
-}
-\`\`\``;
+        const wikiPrompt = buildWikiAnswerPrompt({
+            question: starter.content,
+            threadName: thread.name,
+            langInfo,
+            relevanceMap: buildWikiRelevanceMap(detectedLang),
+            wikiLinks,
+            freshKnowledge,
+            staticKnowledge: PUNCHY_STATIC_KNOWLEDGE,
+            customKnowledge: buildCustomKnowledge(),
+        });
         const rawAnswer = await callGeminiWiki(wikiPrompt);
         
         // Quality check and fix response before sending
@@ -9744,57 +9752,17 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
                 return `${meta?.title || page.replace(/-/g, ' ')}: <${wikiPageUrl(page, detectedLang)}>`;
             }).join('\n');
             
-            const wikiPrompt = `You are Shubba, a knowledgeable wiki expert for the Punchy! Minecraft mod. Continue this conversation naturally.
-
-${GROUNDING_RULES}
-
-${buildLanguageDirective(langInfo)}
-
-THREAD CONTEXT: "${thread.name}"
-
-CONVERSATION HISTORY:
-${conversationContext}
-
-LATEST MESSAGE: ${fullMessage}
-
-══════════════════════════════════════════════════
-WIKI PAGE RELEVANCE MAP — USE THIS TO DECIDE WHICH PAGES APPLY
-══════════════════════════════════════════════════
-${buildWikiRelevanceMap(detectedLang)}
-
-STRICT RULES:
-- Route ordinary players reporting wrong arm/item position to F8 ▸ Hand Positioner.
-  The compat/JSON pages are for CREATORS writing resource packs, not for players.
-- If no page above covers the question, say the wiki doesn't document it and
-  escalate. Do NOT fall back on general Minecraft-modding knowledge to fill the
-  gap — that is how a creator got told to override "type": "useItem" to stop the
-  bow draw, which is wrong (bow charge is use_bow) and cost them their time.
-══════════════════════════════════════════════════
-
-WIKI KNOWLEDGE (complete content of all pages — read all of it, then identify what's relevant):
-${freshWikiKnowledge}
-
-${PACK_PATTERNS_KNOWLEDGE}
-
-PUNCHY MOD FEATURES:
-${PUNCHY_STATIC_KNOWLEDGE}
-${buildCustomKnowledge()}
-
-AVAILABLE WIKI PAGES — COPY THESE URLS VERBATIM. Never construct a wiki URL
-yourself and never link github.com; invented slugs 404. If the page you want is
-not listed, link nothing. Only link pages you used. Use <angle brackets>:
-${wikiLinks}
-
-INSTRUCTIONS:
-- Don't repeat what you already said in the conversation
-- Answer the NEW part of the question only
-- Use the relevance map to pick 1 page max unless 2 are genuinely needed
-- Explain in your own words, don't copy-paste wiki text
-- JSON examples: use \`\`\`json with proper indentation
-- Wiki links: "Page Name: <URL>" not "[Page Name](<URL>)"
-
-Respond in ${langInfo.name}.`;
-
+            const wikiPrompt = buildWikiAnswerPrompt({
+                question: fullMessage,
+                threadName: thread.name,
+                langInfo,
+                relevanceMap: buildWikiRelevanceMap(detectedLang),
+                wikiLinks,
+                freshKnowledge: freshWikiKnowledge,
+                staticKnowledge: PUNCHY_STATIC_KNOWLEDGE,
+                customKnowledge: buildCustomKnowledge(),
+                conversationContext,
+            });
             const rawAnswer = await callGeminiWiki(wikiPrompt);
             
             const fixedAnswer = qualityCheckResponse(rawAnswer, detectedLang);
