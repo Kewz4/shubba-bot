@@ -66,6 +66,19 @@ test('documents the semicolon-terminated timeline flag syntax', () => {
     assert.match(K, /Do NOT invent flag names/i);
 });
 
+test('teaches smear frames as keyframed scale, not a Punchy feature', () => {
+    // Searching the docs for "smear" returns nothing, which is why this must be
+    // recorded explicitly — otherwise the honest-but-wrong answer is "not supported".
+    assert.match(K, /SMEAR FRAMES/i);
+    assert.match(K, /no Punchy feature for this/i);
+    assert.match(K, /Blockbench/i);
+    assert.match(K, /non-uniform scale/i);
+    // The details that make it actually work.
+    assert.match(K, /Scale ONE axis/i, 'must say to scale a single axis');
+    assert.match(K, /squash below 1\.0/i, 'must say stretch alone looks wrong');
+    assert.match(K, /itemgrip_right/, 'must name where the keyframes go');
+});
+
 test('names the itemgrip vs arm bone distinction', () => {
     assert.match(K, /itemgrip_right/);
     assert.match(K, /right_arm/);
