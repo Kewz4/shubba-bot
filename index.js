@@ -67,6 +67,8 @@ const { PACK_PATTERNS_KNOWLEDGE } = require('./lib/pack-patterns');
 const { buildWikiAnswerPrompt } = require('./lib/wiki-prompt');
 // Message shaping (fence-aware splitting + the embed house style).
 const { splitMessage, answerEmbeds, noticeEmbed, COLORS } = require('./lib/discord-format');
+// Decides when Shubba should stay out of a conversation between members.
+const { shouldReplyInThread } = require('./lib/reply-gate');
 const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7936,8 +7938,12 @@ async function solveThread(thread, interactionOrMessage) {
 }
 
 function getSupportButtons() {
+    // "🙋 Request Human Help" was removed at the owner's request. Escalation
+    // still happens — Shubba flags a thread itself when it cannot answer, and
+    // moderators can always step in — it just isn't a button any more.
+    // The 'request_human_help' interaction handler is kept so any button still
+    // sitting in old threads keeps working instead of erroring.
     return new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('request_human_help').setLabel('🙋 Request Human Help').setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId('mark_as_solved').setLabel('✅ Mark As Solved').setStyle(ButtonStyle.Primary)
     );
 }
@@ -9669,6 +9675,63 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
         console.log(`⏭️ Skipping - user is talking to others, not the bot`);
         return;
     }
+
+    // ── Don't interject in a conversation between members ──────────────────
+    // The check above only fires when another user is @mentioned. It misses the
+    // ordinary case: two people replying to each other normally, or a helper
+    // answering the OP. Shubba used to answer EVERY message in an active
+    // thread, so a two-person exchange got a bot reply after each line.
+    try {
+        // Who opened the thread? Prefer remembered value, else read the starter.
+        let opId = threadMemory[thread.id]?.opId;
+        if (!opId) {
+            const starter = await thread.fetchStarterMessage().catch(() => null);
+            opId = starter?.author?.id;
+            if (opId && threadMemory[thread.id]) threadMemory[thread.id].opId = opId;
+        }
+
+        // Resolve a Discord reply target, if this message is one.
+        let isReplyToShubba = false;
+        let isReplyToOtherUser = false;
+        if (message.reference?.messageId) {
+            const ref = await message.channel.messages
+                .fetch(message.reference.messageId).catch(() => null);
+            if (ref) {
+                if (ref.author.id === client.user.id) isReplyToShubba = true;
+                else if (!ref.author.bot) isReplyToOtherUser = true;
+            }
+        }
+
+        const recent = await message.channel.messages.fetch({ limit: 6, before: message.id })
+            .catch(() => null);
+        const recentList = recent ? Array.from(recent.values()) : [];
+        const recentHumanAuthorIds = recentList.filter(m => !m.author.bot).map(m => m.author.id);
+        const lastResponderWasShubba = recentList[0]?.author?.id === client.user.id;
+
+        const gate = shouldReplyInThread({
+            isMentioned,
+            isReplyToShubba,
+            isReplyToOtherUser,
+            mentionsOtherHumans: dynamics.mentionedUsers?.length > 0,
+            authorId: message.author.id,
+            opId,
+            recentHumanAuthorIds,
+            lastResponderWasShubba,
+            content: message.content,
+            hasAttachments: message.attachments.size > 0,
+        });
+
+        if (!gate.reply) {
+            console.log(`⏭️ Not replying in "${thread.name}" — ${gate.reason}`);
+            // Still learn from it; just don't speak.
+            addToThreadMemory(thread.id, message.author.username, message.content, false);
+            return;
+        }
+    } catch (e) {
+        // Never let the gate block a genuine question — fail open and answer.
+        console.warn('[reply-gate] check failed, answering anyway:', e.message);
+    }
+    // ───────────────────────────────────────────────────────────────────────
     
     addToThreadMemory(thread.id, message.author.username, message.content, false);
     extractUserInfo(thread.id, message.content);
