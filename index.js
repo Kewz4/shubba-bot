@@ -66,7 +66,7 @@ const { PACK_PATTERNS_KNOWLEDGE } = require('./lib/pack-patterns');
 // and the /api/knowledge/test-wiki replay harness so they cannot drift.
 const { buildWikiAnswerPrompt } = require('./lib/wiki-prompt');
 // Message shaping (fence-aware splitting + the embed house style).
-const { splitMessage, answerEmbeds, noticeEmbed, COLORS } = require('./lib/discord-format');
+const { splitMessage, answerEmbeds, noticeEmbed, modActionEmbed, COLORS } = require('./lib/discord-format');
 // Decides when Shubba should stay out of a conversation between members.
 const { shouldReplyInThread } = require('./lib/reply-gate');
 // Scoping + safety rules for roles granted by reacting to a message.
@@ -4376,6 +4376,29 @@ async function getOrCreateRole(guild, name, color = null) {
     return role;
 }
 
+/**
+ * Publish a moderation action so EVERYONE can see it.
+ *
+ * These used to be plain-text interaction replies. An interaction reply is tied
+ * to the invocation, easy to miss, and reads as private even when it is not — so
+ * mod actions effectively had no public record. This posts a real channel
+ * message (the record) and leaves the moderator a short confirmation.
+ */
+async function publishModAction(interaction, { action, target, reason, extra = [] }) {
+    const embed = modActionEmbed({
+        action,
+        target: { id: target.id, tag: target.tag || target.username },
+        moderator: { id: interaction.user.id, tag: interaction.user.username },
+        reason,
+        extra,
+    });
+    // The channel message is the record — visible, persistent, linkable.
+    await interaction.channel?.send({ embeds: [embed] }).catch(e =>
+        console.warn('[mod] could not post public record:', e.message));
+    // And close out the slash command itself.
+    return safeEditReply(interaction, { embeds: [embed] });
+}
+
 async function handleWarn(interaction) {
     await safeDefer(interaction, {});
     const target = interaction.options.getMember('user');
@@ -4442,7 +4465,7 @@ async function handleMute(interaction) {
     if (!ms) return safeEditReply(interaction, '❌ Invalid duration. Use formats like: `10m`, `2h`, `1d`, `1w`');
 
     await target.timeout(ms, reason).catch(e => { throw e; });
-    await safeEditReply(interaction, `🔇 **${target.user.username}** has been muted for **${durationStr}**.\n**Reason:** ${reason}`);
+    await publishModAction(interaction, { action: 'mute', target: target.user, reason, extra: [{ name: 'Duration', value: durationStr, inline: true }] });
 }
 
 async function handleUnmute(interaction) {
@@ -4450,7 +4473,7 @@ async function handleUnmute(interaction) {
     const target = interaction.options.getMember('user');
     if (!target) return safeEditReply(interaction, '❌ User not found.');
     await target.timeout(null).catch(() => {});
-    await safeEditReply(interaction, `🔊 **${target.user.username}**'s timeout has been removed.`);
+    await publishModAction(interaction, { action: 'unmute', target: target.user, reason: 'Timeout lifted by a moderator' });
 }
 
 async function handleKick(interaction) {
@@ -4461,7 +4484,7 @@ async function handleKick(interaction) {
     if (DEV_IDS.includes(target.user.id)) return safeEditReply(interaction, '❌ Cannot kick owners.');
     const name = target.user.username;
     await target.kick(reason).catch(e => { throw e; });
-    await safeEditReply(interaction, `👢 **${name}** has been kicked.\n**Reason:** ${reason}`);
+    await publishModAction(interaction, { action: 'kick', target: target.user, reason });
 }
 
 async function handleBan(interaction) {
@@ -4471,14 +4494,14 @@ async function handleBan(interaction) {
     if (!target) return safeEditReply(interaction, '❌ User not found.');
     if (DEV_IDS.includes(target.id)) return safeEditReply(interaction, '❌ Cannot ban owners.');
     await interaction.guild.members.ban(target.id, { reason }).catch(e => { throw e; });
-    await safeEditReply(interaction, `🔨 **${target.username}** has been permanently banned.\n**Reason:** ${reason}`);
+    await publishModAction(interaction, { action: 'ban', target, reason });
 }
 
 async function handleUnban(interaction) {
     await safeDefer(interaction, {});
     const userId = interaction.options.getString('userid');
     await interaction.guild.members.unban(userId, 'Unbanned via /unban').catch(e => { throw e; });
-    await safeEditReply(interaction, `✅ User **${userId}** has been unbanned.`);
+    await publishModAction(interaction, { action: 'unban', target: { id: userId, tag: userId }, reason: 'Unbanned via /unban' });
 }
 
 async function handleWarnings(interaction) {

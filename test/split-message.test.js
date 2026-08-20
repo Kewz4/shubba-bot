@@ -165,3 +165,57 @@ test('notice fields are clamped rather than rejected by the API', () => {
     assert.ok(e.fields[0].value.length <= 1024);
     assert.ok(e.footer.text.length <= LIMITS.EMBED_FOOTER);
 });
+
+// ─── Moderation action embeds ───────────────────────────────────────────────
+const { modActionEmbed, MOD_ACTION_STYLE } = require('../lib/discord-format');
+
+test('a mod action records who, what, and why', () => {
+    const e = modActionEmbed({
+        action: 'ban',
+        target: { id: '111', tag: 'spammer' },
+        moderator: { id: '222', tag: 'kewz.' },
+        reason: 'posting scam links',
+    });
+    assert.match(e.title, /banned/i);
+    const flat = JSON.stringify(e);
+    assert.match(flat, /<@111>/, 'must mention the member');
+    assert.match(flat, /<@222>/, 'must name the moderator');
+    assert.match(flat, /scam links/, 'must carry the reason');
+    assert.match(e.footer.text, /111/, 'user ID belongs in the footer for later lookup');
+});
+
+test('a missing reason is stated, not left blank', () => {
+    const e = modActionEmbed({ action: 'kick', target: { id: '1', tag: 't' }, moderator: { id: '2', tag: 'm' } });
+    assert.match(JSON.stringify(e), /No reason provided/);
+});
+
+test('severity is distinguishable by colour', () => {
+    const colorOf = a => modActionEmbed({ action: a, target: { id: '1' }, moderator: { id: '2' } }).color;
+    assert.notEqual(colorOf('ban'), colorOf('unban'), 'ban and unban must not look alike');
+    assert.notEqual(colorOf('warn'), colorOf('ban'));
+    assert.equal(colorOf('unmute'), MOD_ACTION_STYLE.unmute.color);
+});
+
+test('extra fields (duration, strike) survive', () => {
+    const e = modActionEmbed({
+        action: 'mute', target: { id: '1', tag: 't' }, moderator: { id: '2', tag: 'm' },
+        reason: 'spam', extra: [{ name: 'Duration', value: '2h', inline: true }],
+    });
+    assert.ok(e.fields.some(f => f.name === 'Duration' && f.value === '2h'));
+});
+
+test('an over-long reason is clamped, not rejected by the API', () => {
+    const e = modActionEmbed({
+        action: 'ban', target: { id: '1' }, moderator: { id: '2' }, reason: 'x'.repeat(3000),
+    });
+    const reason = e.fields.find(f => f.name === 'Reason');
+    assert.ok(reason.value.length <= 1024, 'field values cap at 1024');
+});
+
+test('mod actions post a public record, not just an interaction reply', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+    assert.match(src, /interaction\.channel\?\.send\(\{ embeds: \[embed\] \}\)/,
+        'publishModAction must send a real channel message so everyone sees it');
+    const sites = (src.match(/publishModAction\(interaction/g) || []).length;
+    assert.ok(sites >= 6, `all mod actions should publish; found ${sites}`);
+});
