@@ -94,3 +94,62 @@ test('lookup tolerates a missing or malformed store', () => {
     assert.equal(findReactionRole(null, 'm1', { name: '🔥' }), null);
     assert.equal(findReactionRole([], 'm1', { name: '🔥' }), null);
 });
+
+// ── Auto-linking: the "Helper role" leak ────────────────────────────────────
+const { canAutoLinkRole, nameSimilarity } = require('../lib/reaction-roles');
+
+const addon = { threadId: '1534498321195077662', threadName: 'GLORPY - Powered by Punchy!' };
+const strong = { overlap: 5, ratio: 1.0 };
+// A role plausibly created for that addon (newer than the thread).
+const glorpyRole = { id: '1534499000000000000', name: 'GLORPY', permissions: { bitfield: 0n } };
+
+test('a genuine addon role links', () => {
+    assert.equal(canAutoLinkRole(glorpyRole, addon, strong).allowed, true);
+});
+
+test('Helper is never auto-linked, even at 100% overlap', () => {
+    // The actual bug: Helper has no permissions, so a permission-only guard
+    // missed it, and two holders reacting scored a perfect match.
+    const helper = { id: '1512896900465164328', name: 'Helper', permissions: { bitfield: 0n } };
+    const v = canAutoLinkRole(helper, addon, { overlap: 2, ratio: 1.0 });
+    assert.equal(v.allowed, false);
+});
+
+test('staff role names are refused outright', () => {
+    for (const name of ['Helper', 'Moderator', 'Punchers', 'Addon Creator', 'Bug Hunter', 'Staff']) {
+        const r = { id: '1534499000000000000', name, permissions: { bitfield: 0n } };
+        assert.equal(canAutoLinkRole(r, addon, strong).allowed, false, `${name} must not auto-link`);
+    }
+});
+
+test('two overlapping reactors is a coincidence, not a match', () => {
+    assert.equal(canAutoLinkRole(glorpyRole, addon, { overlap: 2, ratio: 1.0 }).allowed, false);
+    assert.equal(canAutoLinkRole(glorpyRole, addon, { overlap: 3, ratio: 1.0 }).allowed, true);
+});
+
+test('a weak member-ratio is refused', () => {
+    assert.equal(canAutoLinkRole(glorpyRole, addon, { overlap: 5, ratio: 0.5 }).allowed, false);
+});
+
+test('a role older than the addon thread cannot belong to it', () => {
+    const old = { id: '1490000000000000000', name: 'GLORPY', permissions: { bitfield: 0n } };
+    const v = canAutoLinkRole(old, addon, strong);
+    assert.equal(v.allowed, false);
+    assert.match(v.reason, /older than/i);
+});
+
+test('a role carrying any permission is refused', () => {
+    const r = { id: '1534499000000000000', name: 'GLORPY', permissions: { bitfield: 1n << 13n } };
+    assert.equal(canAutoLinkRole(r, addon, strong).allowed, false);
+});
+
+test('the name must actually resemble the addon', () => {
+    const unrelated = { id: '1534499000000000000', name: 'whimsical individual', permissions: { bitfield: 0n } };
+    assert.equal(canAutoLinkRole(unrelated, addon, strong).allowed, false);
+});
+
+test('nameSimilarity behaves sensibly', () => {
+    assert.ok(nameSimilarity('GLORPY', 'GLORPY - Powered by Punchy!') >= 0.34);
+    assert.ok(nameSimilarity('Helper', 'GLORPY - Powered by Punchy!') < 0.34);
+    assert.equal(nameSimilarity('', 'anything'), 0);
+});

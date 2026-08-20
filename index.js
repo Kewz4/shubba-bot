@@ -70,7 +70,7 @@ const { splitMessage, answerEmbeds, noticeEmbed, COLORS } = require('./lib/disco
 // Decides when Shubba should stay out of a conversation between members.
 const { shouldReplyInThread } = require('./lib/reply-gate');
 // Scoping + safety rules for roles granted by reacting to a message.
-const { isStarterMessage, findReactionRole, canGrantRole } = require('./lib/reaction-roles');
+const { isStarterMessage, findReactionRole, canGrantRole, canAutoLinkRole } = require('./lib/reaction-roles');
 const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2755,6 +2755,15 @@ async function auditAddonRoles(guild) {
         if (claimedRoles.has(cand.roleId)) continue;
         if (claimedThreads.has(entry.addon.threadId)) continue;
 
+        // Overlap alone is not evidence. A two-member role whose holders both
+        // reacted scored 100% under the old thresholds — that is how "Helper"
+        // got attached to an addon post and then handed to every reactor.
+        const verdict = canAutoLinkRole(cand.role, entry.addon, cand);
+        if (!verdict.allowed) {
+            console.log(`🛑 Not linking "${entry.addon.threadName}" → "${cand.role.name}": ${verdict.reason}`);
+            continue;
+        }
+
         entry.addon.roleId = cand.roleId;
         entry.addon.roleName = cand.role.name;
         claimedRoles.add(cand.roleId);
@@ -4748,9 +4757,9 @@ async function sendDuplicateAlert(guild, newThread, matches) {
         ).join('\n\n');
 
         const newThreadUrl = `https://discord.com/channels/${guild.id}/${newThread.id}`;
-        // Triage, not a dev emergency: notify the mod/helper roles instead of
-        // @-pinging both owners for every suspected duplicate.
-        const ownerPings = [MOD_ROLE_ID, HELPER_ROLE_ID].filter(Boolean).map(id => `<@&${id}>`).join(' ');
+        // No ping at all. The alert is posted where moderators already look;
+        // a suspected duplicate never justifies notifying anyone.
+        const ownerPings = '';
 
         const alertContent = [
             `🔍 **Possible Duplicate Detected** ${ownerPings}`,
@@ -7804,10 +7813,15 @@ async function applyTagsFromConversation(message, thread) {
  * @param {object} thread
  * @param {string} reason
  * @param {'silent'|'mods'|'devs'} [notify='silent']
- *   silent — rename + red embed, no ping. The default, and the right choice for
- *            anything caused by Shubba rather than by the user.
- *   mods   — ping the Moderator/Helper roles. Use when a human should look.
- *   devs   — ping the owners directly. Reserve for genuinely dev-only issues.
+ *   silent — rename + red embed, no ping. THE DEFAULT. Use whenever the signal
+ *            is uncertain: anything Shubba caused itself, anything it only
+ *            suspects, anything a human will see anyway by reading the forum.
+ *   devs   — ping the owners. ONLY when the case is unambiguous and a person
+ *            genuinely must act: e.g. the user supplied a video AND full
+ *            reproduction context. If you are unsure, it is not certain, and
+ *            the answer is silent.
+ *   mods   — reserved; currently unused. The owner does not want the
+ *            Moderator/Helper roles pinged by the bot.
  */
 async function requestHumanHelp(thread, reason, notify = 'silent') {
     if (thread.name.startsWith('(HUMAN HELP)')) return;
@@ -8474,7 +8488,7 @@ client.on(Events.ThreadCreate, async (thread) => {
         const hasMeaningfulDescription = (starter.content || '').trim().length >= 30;
         if (hasVideo && hasRequiredTags && hasMeaningfulDescription) { 
             processingThreads.delete(thread.id); 
-            return await requestHumanHelp(thread, "Video posted with enough context for a human to review.", 'mods'); 
+            return await requestHumanHelp(thread, "Video posted with full reproduction context.", 'devs'); 
         }
         // If video but missing info, fall through — Shubba will respond and ask for what's missing
         
@@ -9784,7 +9798,7 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
         const hasContext = mem.conversationHistory.length >= 2 ||
             (mem.conversationHistory.length >= 1 && mem.conversationHistory[0].content.trim().length >= 30);
         if (hasVersionTag && hasLoaderTag && hasContext) {
-            return await requestHumanHelp(thread, "Video posted with enough context for a human to review.", 'mods');
+            return await requestHumanHelp(thread, "Video posted with full reproduction context.", 'devs');
         }
         // Fall through — Shubba will respond and collect the missing info
     }
@@ -11281,7 +11295,7 @@ async function handleInteractionCore(interaction) {
         if (interaction.customId === 'request_human_help') {
             // Anyone can request human help
             await safeDefer(interaction, { flags: [MessageFlags.Ephemeral] });
-            await requestHumanHelp(interaction.channel, "A member asked for a human.", 'mods');
+            await requestHumanHelp(interaction.channel, "A member asked for a human.");
             await safeEditReply(interaction, { content: "✅ Flagged for human help." });
         } else if (interaction.customId === 'mark_as_solved') {
             // Anyone can mark as solved (thread creator, admins, or owners)
