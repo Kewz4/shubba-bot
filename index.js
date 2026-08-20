@@ -71,6 +71,25 @@ const { splitMessage, answerEmbeds, noticeEmbed, modActionEmbed, noPing, stripMe
 const { shouldReplyInThread } = require('./lib/reply-gate');
 // Deterministic schema check for creator files — cannot hallucinate a rule.
 const { validate: validatePunchyFile } = require('./lib/punchy-validate');
+// Version-aware solution memory: detect, distil, dedupe, rank.
+const {
+    distil: distilSolution,
+    isDuplicate: isDuplicateSolution,
+    pickRelevant: pickRelevantSolutions,
+    renderForPrompt: renderSolutionsForPrompt,
+} = require('./lib/solutions');
+
+// Mods that actually come up in this server's bug reports. Used to tag a
+// solution with the mods involved so retrieval can match on them.
+const KNOWN_MOD_NAMES = [
+    'Better Combat', 'First Person Model', '3D Skin Layers', 'Hold My Items',
+    'Refined Buckets', 'Refined Torches', 'Sable', 'Axiom', 'Controlify',
+    'Iris', 'Sodium', 'Embeddium', 'Oculus', 'Optifine', 'Distant Horizons',
+    'Create', 'Tinkers Construct', 'Cobblemon', 'Prominence', 'Voxy',
+    'Photon', 'Complementary', 'Tide', 'Spearwork', 'Cavern & Chasms',
+    'Adorable Hamsters', 'Enchanted Fishing Line', 'Better Fishing',
+    'Tiny Takeover', 'ModMenu', 'Configured', 'Ars Nouveau', 'Balkon',
+];
 // Scoping + safety rules for roles granted by reacting to a message.
 const { isStarterMessage, findReactionRole, canGrantRole, canAutoLinkRole } = require('./lib/reaction-roles');
 const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
@@ -7116,53 +7135,45 @@ function extractLogUrls(content) {
 async function storeSolution(thread) {
     try {
         console.log(`💾 Storing solution from solved thread: ${thread.name}`);
-        
-        // Fetch all messages from the thread
-        const messages = await thread.messages.fetch({ limit: 50 });
-        const messageArray = Array.from(messages.values()).reverse();
-        
-        // Extract conversation
-        const conversation = messageArray.map(m => 
-            `${m.author.username}: ${m.content.substring(0, 500)}`
-        ).join('\n');
-        
-        // Extract user's issue (first message)
-        const firstMessage = messageArray[0];
-        const issue = firstMessage?.content.substring(0, 300) || "Unknown issue";
-        
-        // Extract versions from thread tags
-        const tags = thread.appliedTags.map(tagId => 
-            thread.parent.availableTags.find(t => t.id === tagId)?.name
-        ).filter(Boolean);
-        
-        const solution = {
+
+        const fetched = await thread.messages.fetch({ limit: 50 });
+        const messages = Array.from(fetched.values()).reverse().map(m => ({
+            author: m.author.username,
+            content: String(m.content || ""),
+            isBot: !!m.author.bot,
+        }));
+
+        const tags = (thread.appliedTags || []).map(id =>
+            thread.parent?.availableTags?.find(t => t.id === id)?.name).filter(Boolean);
+
+        // Version comes from the THREAD, not from a hand-maintained constant.
+        // CURRENT_VERSION_SET is only a last resort when nobody stated one.
+        const solution = distilSolution({
             threadName: thread.name,
-            issue: issue,
-            tags: tags,
-            conversation: conversation,
-            solvedDate: new Date().toISOString(),
             threadId: thread.id,
-            version: CURRENT_VERSION_SET
-        };
-        
-        // Ensure current version array exists
-        if (!SOLUTIONS_BY_VERSION[CURRENT_VERSION_SET]) {
-            SOLUTIONS_BY_VERSION[CURRENT_VERSION_SET] = [];
+            messages,
+            tags,
+            fallbackPunchy: CURRENT_VERSION_SET,
+            knownMods: KNOWN_MOD_NAMES,
+        });
+
+        const bucket = solution.line || CURRENT_VERSION_SET;
+        if (!SOLUTIONS_BY_VERSION[bucket]) SOLUTIONS_BY_VERSION[bucket] = [];
+
+        // Do not store the same fix twice — the old store had no dedupe at all.
+        const dupIdx = SOLUTIONS_BY_VERSION[bucket].findIndex(e => isDuplicateSolution(solution, e));
+        if (dupIdx !== -1) {
+            SOLUTIONS_BY_VERSION[bucket][dupIdx] = solution; // refresh with the newer wording
+            console.log(`♻️ Updated existing solution in ${bucket}: ${solution.threadName}`);
+        } else {
+            SOLUTIONS_BY_VERSION[bucket].unshift(solution);
+            if (SOLUTIONS_BY_VERSION[bucket].length > MAX_SOLUTIONS_PER_VERSION) {
+                SOLUTIONS_BY_VERSION[bucket] = SOLUTIONS_BY_VERSION[bucket].slice(0, MAX_SOLUTIONS_PER_VERSION);
+            }
+            console.log(`✅ Solution stored under ${bucket} (Punchy ${solution.punchyVersion || "?"}, MC ${solution.mcVersion || "?"}). Total: ${SOLUTIONS_BY_VERSION[bucket].length}`);
         }
-        
-        // Add to current version's solutions array
-        SOLUTIONS_BY_VERSION[CURRENT_VERSION_SET].unshift(solution);
-        
-        // Keep only last MAX_SOLUTIONS_PER_VERSION for current version
-        if (SOLUTIONS_BY_VERSION[CURRENT_VERSION_SET].length > MAX_SOLUTIONS_PER_VERSION) {
-            SOLUTIONS_BY_VERSION[CURRENT_VERSION_SET] = SOLUTIONS_BY_VERSION[CURRENT_VERSION_SET].slice(0, MAX_SOLUTIONS_PER_VERSION);
-        }
-        
-        // Save to Google Cloud Storage
+
         await saveSolutionsToGCS();
-        
-        console.log(`✅ Solution stored for version ${CURRENT_VERSION_SET}. Total: ${SOLUTIONS_BY_VERSION[CURRENT_VERSION_SET].length}`);
-        
     } catch (e) {
         console.error("⚠️ Failed to store solution:", e.message);
     }
@@ -7247,23 +7258,26 @@ Write a single knowledge entry (2-6 sentences max) starting with what the questi
 }
 
 
-function buildSolutionsKnowledge() {
-    const currentSolutions = SOLUTIONS_BY_VERSION[CURRENT_VERSION_SET] || [];
-    
-    if (currentSolutions.length === 0) return "";
-    
-    let knowledge = `\n--- SOLVED SOLUTIONS DATABASE (Version ${CURRENT_VERSION_SET}) ---\n`;
-    knowledge += `(${currentSolutions.length} solutions for version ${CURRENT_VERSION_SET})\n\n`;
-    
-    currentSolutions.forEach((solution, index) => {
-        knowledge += `[Solution ${index + 1}] ${solution.threadName}\n`;
-        knowledge += `Tags: ${solution.tags.join(', ')}\n`;
-        knowledge += `Issue: ${solution.issue}\n`;
-        knowledge += `Resolution:\n${solution.conversation.substring(0, 1000)}\n`;
-        knowledge += `---\n`;
-    });
-    
-    return knowledge;
+/**
+ * Pick the few past solutions relevant to THIS question.
+ *
+ * Was: paste every solution for CURRENT_VERSION_SET into the prompt, up to
+ * 1000 chars of raw transcript each, ignoring all other versions. That was
+ * simultaneously too noisy (50 irrelevant fixes) and too forgetful (a good 2.6
+ * fix was invisible to a 2.7 question).
+ */
+function buildSolutionsKnowledge(questionText = "", tags = []) {
+    try {
+        const hits = pickRelevantSolutions(SOLUTIONS_BY_VERSION, {
+            text: questionText,
+            tags,
+            knownMods: KNOWN_MOD_NAMES,
+        }, { limit: 4 });
+        return renderSolutionsForPrompt(hits);
+    } catch (e) {
+        console.log("[solutions] retrieval failed:", e.message);
+        return "";
+    }
 }
 
 /**
@@ -7302,10 +7316,16 @@ async function fetchWikiPage(pageName, langCode = 'EN-US', retryCount = 0) {
     };
 }
 
-async function getFreshKnowledge(forceRefresh = false, langCode = 'EN-US') {
+async function getFreshKnowledge(forceRefresh = false, langCode = 'EN-US', question = {}) {
+    // Optional: when the caller knows what was asked, past solutions are ranked
+    // against it instead of dumped wholesale.
+    const questionText = String(question.text || '');
+    const questionTags = question.tags || [];
     const now = Date.now();
     
-    if (!forceRefresh && DYNAMIC_KNOWLEDGE_CACHE[langCode]) {
+    // A cached buffer contains solutions picked for a DIFFERENT question, so it
+    // is only reusable when no question was supplied.
+    if (!forceRefresh && !questionText && DYNAMIC_KNOWLEDGE_CACHE[langCode]) {
         const cached = DYNAMIC_KNOWLEDGE_CACHE[langCode];
         if (now - cached.time < KNOWLEDGE_CACHE_DURATION) {
             console.log(`📦 Using cached knowledge (${langCode})`);
@@ -7402,12 +7422,12 @@ async function getFreshKnowledge(forceRefresh = false, langCode = 'EN-US') {
 
     // 5. Solved Solutions Database (only for EN-US)
     if (langCode === 'EN-US') {
-        knowledgeBuffer += buildSolutionsKnowledge();
+        knowledgeBuffer += buildSolutionsKnowledge(questionText, questionTags);
     }
 
     // 6. Solved Solutions Database (only for EN-US)
     if (langCode === 'EN-US') {
-        knowledgeBuffer += buildSolutionsKnowledge();
+        knowledgeBuffer += buildSolutionsKnowledge(questionText, questionTags);
     }
 
     // NOTE: PUNCHY_STATIC_KNOWLEDGE and buildCustomKnowledge() are injected
@@ -8779,7 +8799,7 @@ client.on(Events.ThreadCreate, async (thread) => {
         await validatePunchyFiles(starter).catch(e => console.log('[validate]', e.message));
 
         // Always force-fetch fresh wiki pages per question — never use cache for wiki answers
-        const freshKnowledge = await getFreshKnowledge(true, detectedLang);
+        const freshKnowledge = await getFreshKnowledge(true, detectedLang, { text: starter.content });
         
         const wikiLinks = WIKI_PAGES.map(page => {
             // Canonical URL comes from the wiki corpus, never hand-built — the
@@ -9981,7 +10001,7 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             
             await validatePunchyFiles(message).catch(e => console.log('[validate]', e.message));
 
-            const freshWikiKnowledge = await getFreshKnowledge(true, detectedLang);
+            const freshWikiKnowledge = await getFreshKnowledge(true, detectedLang, { text: fullMessage });
             
             const wikiLinks = WIKI_PAGES.map(page => {
                 // Was `github.com/.../${page}-${detectedLang}` — which produced
