@@ -69,6 +69,8 @@ const { buildWikiAnswerPrompt } = require('./lib/wiki-prompt');
 const { splitMessage, answerEmbeds, noticeEmbed, modActionEmbed, noPing, stripMentions, COLORS } = require('./lib/discord-format');
 // Decides when Shubba should stay out of a conversation between members.
 const { shouldReplyInThread } = require('./lib/reply-gate');
+// Deterministic schema check for creator files — cannot hallucinate a rule.
+const { validate: validatePunchyFile } = require('./lib/punchy-validate');
 // Scoping + safety rules for roles granted by reacting to a message.
 const { isStarterMessage, findReactionRole, canGrantRole, canAutoLinkRole } = require('./lib/reaction-roles');
 const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
@@ -7824,6 +7826,82 @@ async function applyTagsFromConversation(message, thread) {
     return applyTagsFromText(message, thread);
 }
 
+// ─── DETERMINISTIC FILE VALIDATION ───────────────────────────────────────────
+// Runs BEFORE the model gets involved. If a creator's file has a real defect,
+// we say so from the schema rather than reasoning about it — this is the check
+// that would have caught the "override useItem to stop the bow draw" answer.
+
+const VALIDATE_MAX_BYTES = 400 * 1024;
+
+/** Pull candidate Punchy files out of a message: code blocks + .json attachments. */
+async function extractPunchyFiles(message) {
+    const files = [];
+
+    // Fenced blocks, json-tagged or not — creators forget the tag constantly.
+    const fence = /```(?:json|jsonc|js)?\s*\n([\s\S]*?)```/g;
+    let m;
+    while ((m = fence.exec(message.content || '')) !== null) {
+        const body = (m[1] || '').trim();
+        if (body.startsWith('{') || body.startsWith('[')) files.push({ name: 'pasted block', text: body });
+    }
+
+    for (const att of (message.attachments?.values() ? Array.from(message.attachments.values()) : [])) {
+        const n = String(att.name || '').toLowerCase();
+        if (!/\.(json|mcmeta)$/.test(n)) continue;
+        if ((att.size || 0) > VALIDATE_MAX_BYTES) continue;
+        try {
+            const res = await axios.get(att.url, { timeout: 15000, responseType: 'text', transformResponse: r => r });
+            files.push({ name: att.name, text: String(res.data) });
+        } catch (e) {
+            console.log(`⚠️ Could not fetch attachment ${att.name}: ${e.message}`);
+        }
+    }
+    return files;
+}
+
+/**
+ * Validate any Punchy files in a message and post the result.
+ * @returns {Promise<boolean>} true if a file with ERRORS was reported
+ */
+async function validatePunchyFiles(message) {
+    let files;
+    try { files = await extractPunchyFiles(message); }
+    catch (e) { console.log('[validate] extract failed:', e.message); return false; }
+    if (!files.length) return false;
+
+    let hadErrors = false;
+    for (const f of files.slice(0, 3)) {
+        let result;
+        try { result = validatePunchyFile(f.text, { filename: f.name }); }
+        catch (e) { console.log('[validate] threw on', f.name, e.message); continue; }
+
+        // Nothing useful to say about a file we do not recognise.
+        if (result.type === 'unknown') continue;
+
+        const errors = result.issues.filter(i => i.level === 'error');
+        const warns = result.issues.filter(i => i.level === 'warning');
+        const infos = result.issues.filter(i => i.level === 'info');
+        if (!errors.length && !warns.length && !infos.length) continue;
+
+        const line = (i) => `• ${i.line ? `(line ${i.line}) ` : ''}${i.msg}`;
+        const parts = [];
+        if (errors.length) parts.push('**Errors — these stop it working**\n' + errors.slice(0, 8).map(line).join('\n'));
+        if (warns.length) parts.push('**Worth checking**\n' + warns.slice(0, 6).map(line).join('\n'));
+        if (infos.length && !errors.length) parts.push('**Suggestions**\n' + infos.slice(0, 4).map(line).join('\n'));
+
+        const label = { compat: 'compat file', animation: 'animation', model_parts: 'Model Parts file', geo: 'geo model', mcmeta: 'pack.mcmeta', 'invalid-json': 'file', 'compat-unwrapped': 'compat file' }[result.type] || result.type;
+        const embed = noticeEmbed({
+            title: errors.length ? `❌ Problems in your ${label}` : `✅ Your ${label} checks out`,
+            description: parts.join('\n\n') || 'No problems found.',
+            color: errors.length ? COLORS.ESCALATE : COLORS.SOLVED,
+            footer: `${f.name} · checked against Punchy's schema, not guessed`,
+        });
+        await message.reply(noPing({ embeds: [embed] })).catch(e => console.log('[validate] reply failed:', e.message));
+        if (errors.length) hadErrors = true;
+    }
+    return hadErrors;
+}
+
 /**
  * Flag a thread as needing a human.
  *
@@ -8695,6 +8773,10 @@ client.on(Events.ThreadCreate, async (thread) => {
         threadMemory[thread.id].opId = starter.author.id;
         threadMemory[thread.id].opUsername = starter.author.username;
         const conversationContext = buildConversationContext(thread.id);
+
+        // Schema-check any pasted/attached file BEFORE the model reasons about it.
+        // A validator cannot invent a rule; the model can, and did.
+        await validatePunchyFiles(starter).catch(e => console.log('[validate]', e.message));
 
         // Always force-fetch fresh wiki pages per question — never use cache for wiki answers
         const freshKnowledge = await getFreshKnowledge(true, detectedLang);
@@ -9897,6 +9979,8 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             const langInfo = SUPPORTED_LANGUAGES[detectedLang];
             console.log(`🌐 Continuing conversation in: ${langInfo.nativeName} (${detectedLang})`);
             
+            await validatePunchyFiles(message).catch(e => console.log('[validate]', e.message));
+
             const freshWikiKnowledge = await getFreshKnowledge(true, detectedLang);
             
             const wikiLinks = WIKI_PAGES.map(page => {
