@@ -66,7 +66,7 @@ const { PACK_PATTERNS_KNOWLEDGE } = require('./lib/pack-patterns');
 // and the /api/knowledge/test-wiki replay harness so they cannot drift.
 const { buildWikiAnswerPrompt } = require('./lib/wiki-prompt');
 // Message shaping (fence-aware splitting + the embed house style).
-const { splitMessage, answerEmbeds, noticeEmbed, modActionEmbed, COLORS } = require('./lib/discord-format');
+const { splitMessage, answerEmbeds, noticeEmbed, modActionEmbed, noPing, stripMentions, COLORS } = require('./lib/discord-format');
 // Decides when Shubba should stay out of a conversation between members.
 const { shouldReplyInThread } = require('./lib/reply-gate');
 // Scoping + safety rules for roles granted by reacting to a message.
@@ -7873,7 +7873,9 @@ async function requestHumanHelp(thread, reason, notify = 'silent') {
         };
         // Pings only fire from message content, so only set it when we mean it.
         if (pings) payload.content = pings;
-        await thread.send(payload);
+        // This is the one sanctioned ping path: opt in explicitly, and only for
+        // the IDs we just built. Everything else Shubba sends is mention-free.
+        await thread.send(noPing(payload, notify === 'devs' ? { users: DEV_IDS } : undefined));
         console.log(`🚩 Flagged "${thread.name}" (notify=${notify}) — ${reason}`);
     } catch (e) { console.error("Failed to flag thread:", e); }
 }
@@ -8033,7 +8035,12 @@ function parseButtonSignal(text) {
  * Fixes: JSON formatting, broken links, markdown issues.
  */
 function qualityCheckResponse(text, langCode = 'EN-US') {
-    let fixed = text;
+    // 0. Neutralise any mention the model wrote into its own answer.
+    //    Observed in production: Shubba authored "Attention: @Godku @punchymod"
+    //    inside a reply and pinged both owners without ever going through
+    //    requestHumanHelp(). allowedMentions stops the ping; this stops the text
+    //    from claiming a dev was summoned when none was.
+    let fixed = stripMentions(text);
     
     // 1. Fix JSON code blocks - ensure proper formatting
     fixed = fixed.replace(/```json\s*\n?\s*{/g, '```json\n{');
@@ -8734,9 +8741,9 @@ client.on(Events.ThreadCreate, async (thread) => {
         for (let i = 0; i < embeds.length; i += 10) {
             const batch = embeds.slice(i, i + 10);
             const isLast = i + 10 >= embeds.length;
-            await thread.send(isLast
+            await thread.send(noPing(isLast
                 ? { embeds: batch, components: [getSupportButtons()] }
-                : { embeds: batch });
+                : { embeds: batch }));
         }
         
       } catch (error) { 
@@ -11600,6 +11607,14 @@ The two buttons are:
   (There is NO "Request Human Help" button any more. Never tell a user to press
   one, and never offer to ping the developers. If a thread genuinely needs a
   human, YOU flag it — silently — and simply say a human will take a look.)
+
+  NEVER WRITE AN @MENTION. Not <@id>, not <@&role>, not @everyone, not "@Godku"
+  or "@punchymod". You once wrote "🚩 Human Help Requested! Attention: @Godku
+  @punchymod" into a reply and notified both owners for a mod-compat issue that
+  needed no immediate attention — the user then apologised for pinging them.
+  You do not summon people. Say "I've flagged this for the team" and stop.
+  If a user types "request human help" as a message, that is NOT a command:
+  answer them normally, flag the thread if it warrants it, and do not ping.
 
 Showing these buttons is a real action that affects a real person. Don't show them by default. Don't show them as decoration. Run this decision tree:
 
