@@ -69,6 +69,8 @@ const { buildWikiAnswerPrompt } = require('./lib/wiki-prompt');
 const { splitMessage, answerEmbeds, noticeEmbed, COLORS } = require('./lib/discord-format');
 // Decides when Shubba should stay out of a conversation between members.
 const { shouldReplyInThread } = require('./lib/reply-gate');
+// Scoping + safety rules for roles granted by reacting to a message.
+const { isStarterMessage, findReactionRole, canGrantRole } = require('./lib/reaction-roles');
 const { createMentionGate, channelKindOf } = require('./lib/mention-policy');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4746,7 +4748,9 @@ async function sendDuplicateAlert(guild, newThread, matches) {
         ).join('\n\n');
 
         const newThreadUrl = `https://discord.com/channels/${guild.id}/${newThread.id}`;
-        const ownerPings = DEV_IDS.map(id => `<@${id}>`).join(' ');
+        // Triage, not a dev emergency: notify the mod/helper roles instead of
+        // @-pinging both owners for every suspected duplicate.
+        const ownerPings = [MOD_ROLE_ID, HELPER_ROLE_ID].filter(Boolean).map(id => `<@&${id}>`).join(' ');
 
         const alertContent = [
             `🔍 **Possible Duplicate Detected** ${ownerPings}`,
@@ -7788,28 +7792,52 @@ async function applyTagsFromConversation(message, thread) {
     return applyTagsFromText(message, thread);
 }
 
-async function requestHumanHelp(thread, reason) {
+/**
+ * Flag a thread as needing a human.
+ *
+ * PINGING IS THE EXCEPTION, NOT THE RULE. This used to @-ping BOTH owners on
+ * EVERY escalation — including transient AI failures and "a video was posted"
+ * — so kewz. and PunchyMan were notified constantly for things no dev needed
+ * to see. Renaming the thread to "(HUMAN HELP)" is already visible to anyone
+ * scanning the forum; a ping should mean "a person must act now".
+ *
+ * @param {object} thread
+ * @param {string} reason
+ * @param {'silent'|'mods'|'devs'} [notify='silent']
+ *   silent — rename + red embed, no ping. The default, and the right choice for
+ *            anything caused by Shubba rather than by the user.
+ *   mods   — ping the Moderator/Helper roles. Use when a human should look.
+ *   devs   — ping the owners directly. Reserve for genuinely dev-only issues.
+ */
+async function requestHumanHelp(thread, reason, notify = 'silent') {
     if (thread.name.startsWith('(HUMAN HELP)')) return;
     try {
         const cleanName = thread.name.replace('[SOLVED] ', '');
-        const prefix = '(HUMAN HELP) ';
-        // Discord thread names max 100 chars
-        const truncated = (prefix + cleanName).substring(0, 100);
+        const truncated = ('(HUMAN HELP) ' + cleanName).substring(0, 100);
         await thread.setName(truncated);
-        const pings = DEV_IDS.map(id => `<@${id}>`).join(' ');
+
+        let pings = '';
+        if (notify === 'devs') {
+            pings = DEV_IDS.map(id => `<@${id}>`).join(' ');
+        } else if (notify === 'mods') {
+            pings = [MOD_ROLE_ID, HELPER_ROLE_ID].filter(Boolean).map(id => `<@&${id}>`).join(' ');
+        }
+
         const isWikiForum = thread.parentId === WIKI_FORUM_ID;
         const helpType = isWikiForum ? "Wiki question needs human help" : "Support issue needs human help";
-        // Red embed: an escalation should be visually distinct from an answer at
-        // a glance, so moderators scanning a busy forum spot it immediately.
-        await thread.send({
-            content: pings, // pings must be in content to actually notify
+        const payload = {
             embeds: [noticeEmbed({
                 title: '🚩 Human help requested',
-                description: `${helpType}\n**Reason:** ${reason}`,
+                description: `${helpType}
+**Reason:** ${reason}`,
                 color: COLORS.ESCALATE,
                 footer: "Shubba has stepped aside and won't reply again unless tagged.",
             })],
-        });
+        };
+        // Pings only fire from message content, so only set it when we mean it.
+        if (pings) payload.content = pings;
+        await thread.send(payload);
+        console.log(`🚩 Flagged "${thread.name}" (notify=${notify}) — ${reason}`);
     } catch (e) { console.error("Failed to flag thread:", e); }
 }
 
@@ -8446,7 +8474,7 @@ client.on(Events.ThreadCreate, async (thread) => {
         const hasMeaningfulDescription = (starter.content || '').trim().length >= 30;
         if (hasVideo && hasRequiredTags && hasMeaningfulDescription) { 
             processingThreads.delete(thread.id); 
-            return await requestHumanHelp(thread, "Video with full context detected — escalating."); 
+            return await requestHumanHelp(thread, "Video posted with enough context for a human to review.", 'mods'); 
         }
         // If video but missing info, fall through — Shubba will respond and ask for what's missing
         
@@ -8535,7 +8563,7 @@ client.on(Events.ThreadCreate, async (thread) => {
         
         if (rawAnswer.startsWith("ERROR:")) {
             processingThreads.delete(thread.id);
-            return await requestHumanHelp(thread, "AI analysis failed - " + rawAnswer.substring(6));
+            return await requestHumanHelp(thread, "Shubba could not analyse this automatically.", 'silent');
         }
         
         addToThreadMemory(thread.id, client.user.username, rawAnswer, true);
@@ -9756,7 +9784,7 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
         const hasContext = mem.conversationHistory.length >= 2 ||
             (mem.conversationHistory.length >= 1 && mem.conversationHistory[0].content.trim().length >= 30);
         if (hasVersionTag && hasLoaderTag && hasContext) {
-            return await requestHumanHelp(thread, "Video posted with full context — escalating to devs.");
+            return await requestHumanHelp(thread, "Video posted with enough context for a human to review.", 'mods');
         }
         // Fall through — Shubba will respond and collect the missing info
     }
@@ -9933,7 +9961,7 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             
             if (rawAnswer.startsWith("ERROR:")) {
                 processingThreads.delete(thread.id);
-                return await requestHumanHelp(thread, "AI analysis failed - " + rawAnswer.substring(6));
+                return await requestHumanHelp(thread, "Shubba could not analyse this automatically.", 'silent');
             }
             
             addToThreadMemory(thread.id, client.user.username, rawAnswer, true);
@@ -11253,7 +11281,7 @@ async function handleInteractionCore(interaction) {
         if (interaction.customId === 'request_human_help') {
             // Anyone can request human help
             await safeDefer(interaction, { flags: [MessageFlags.Ephemeral] });
-            await requestHumanHelp(interaction.channel, "User requested help.");
+            await requestHumanHelp(interaction.channel, "A member asked for a human.", 'mods');
             await safeEditReply(interaction, { content: "✅ Flagged for human help." });
         } else if (interaction.customId === 'mark_as_solved') {
             // Anyone can mark as solved (thread creator, admins, or owners)
@@ -11423,7 +11451,7 @@ THE FOUR THINKING PRINCIPLES — APPLY THESE TO EVERY MESSAGE
    - The whole point of you existing is to handle the questions the owners would otherwise have to handle.
    - For every reply, mentally check: "Would kewz. or PunchyMan actually want to be pinged for this, or can I solve it?" Solve what you can solve.
    - But also: "Am I confidently solving this, or am I going to make it worse and then they have to clean up?" If the latter, escalate cleanly with a summary.
-   - When you DO escalate via "Request Human Help", make their job easy: pre-summarize the issue, tags, version, what's been tried.
+   - When a thread genuinely needs a human, make their job easy: pre-summarise the issue, tags, version, and what has already been tried. Do not ping anyone and do not promise that you will.
 
 4. NO FILLER, NO SLOP, NO PERFORMATIVE HELPFULNESS
    - Do not write sentences that exist only to seem helpful. ("I'd be happy to help!" "Let me look into that for you!") Cut them.
@@ -11530,8 +11558,11 @@ STEP 3 — DO I HAVE THE RIGHT DETAILS?
 STEP 4 — SHOULD I SHOW THE SUPPORT BUTTONS? (run this reasoning EVERY time)
 
 The two buttons are:
-  🙋 Request Human Help — pings kewz./PunchyMan to come look at the thread
   ✅ Mark As Solved — closes the thread as resolved
+
+  (There is NO "Request Human Help" button any more. Never tell a user to press
+  one, and never offer to ping the developers. If a thread genuinely needs a
+  human, YOU flag it — silently — and simply say a human will take a look.)
 
 Showing these buttons is a real action that affects a real person. Don't show them by default. Don't show them as decoration. Run this decision tree:
 
@@ -11546,21 +11577,21 @@ B. Was my answer actually a SOLUTION the user can act on?
 
 C. Did I confidently solve this, or did I half-answer?
    → "I think this might work, but try X" with low confidence → SHOW buttons (so they can escalate if it doesn't work)
-   → "I really don't know what's causing this" → SHOW buttons (so they can request human help)
+   → "I really don't know what's causing this" → say so plainly and flag the thread yourself
    → A confident, specific fix → SHOW buttons (so they can mark solved when it works)
 
 D. Is this a follow-up message in an active thread?
    → User just acknowledged my previous answer ("ok thanks", "trying now") → [NO_BUTTONS] (buttons already shown earlier; don't double up)
    → User came back with new info or a new question → re-evaluate as A/B/C
    → User confirmed the fix worked → [NO_BUTTONS] (let them just hit Mark As Solved themselves; no need to re-show)
-   → User said the fix didn't work → SHOW buttons (so they can Request Human Help)
+   → User said the fix didn't work → try once more or flag the thread yourself; do not ping
 
 E. Is the thread already in a terminal state?
    → Already marked [SOLVED] / [CLOSED] / [DUPLICATE] → [NO_BUTTONS]
    → Already (HUMAN HELP) → [NO_BUTTONS] (buttons would be redundant)
 
-F. Am I about to ping the owners over something trivial?
-   → User asked a simple FAQ-style question with a clear answer → [NO_BUTTONS] (don't tempt them to ping owners; just answer cleanly)
+F. Am I about to escalate something trivial?
+   → User asked a simple FAQ-style question with a clear answer → [NO_BUTTONS] (just answer cleanly)
    → User issue is genuinely a bug or beyond your knowledge → SHOW buttons
 
 If your reasoning lands on "show buttons" — do nothing special, they're shown by default.
@@ -11574,12 +11605,12 @@ STEP 5 — CAN I SOLVE THIS ON MY OWN?
     Example: "This might be caused by X. Try Y, but if it doesn't work, a dev should check this."
   → "I can't solve this alone" → Don't fake it. Compile everything neatly for the devs.
     Example: "I can see what's happening but I don't have enough to fix this. I've summarized
-    the issue for the team — use 'Request Human Help' to escalate."
+    the issue for the team, and flagged this thread so a human can pick it up."
 
 WHAT GOOD LOOKS LIKE:
   ✓ "I can see you're having an arm animation glitch. To reproduce this I need a video — can you record it?"
   ✓ "This looks like a mod conflict. Which specific mod do you think is causing it? If unsure, share your latest.log."
-  ✓ "I've checked the known issues and this matches a previous report. Try [solution]. If it doesn't fix it, hit 'Request Human Help'."
+  ✓ "I've checked the known issues and this matches a previous report. Try [solution] — if it doesn't help, say so and I'll flag this for a human."
   ✓ "I can't confidently solve this without a crash report. Can you paste yours from .minecraft/crash-reports/?"
 
 WHAT BAD LOOKS LIKE (NEVER DO THIS):
@@ -11871,6 +11902,10 @@ client.on('messageReactionAdd', async (reaction, user) => {
     // ── Addon forum 🔥 reactions ──────────────────────────────
     if (isAddonThread && reaction.emoji.name === '🔥') {
         const threadId = thread.id;
+        // LEAK FIX: only the thread's STARTER post grants the role. This used to
+        // accept a 🔥 on ANY message in the thread, so reacting to a random
+        // comment handed out the addon role.
+        if (!isStarterMessage(reaction.message.id, threadId)) return;
         const addon = addonRolesStore[threadId];
         if (!addon) return;
 
@@ -11893,17 +11928,24 @@ client.on('messageReactionAdd', async (reaction, user) => {
     }
 
     // ── Standard reaction roles ───────────────────────────────
-    const match = reactionRolesStore.find(r =>
-        r.messageId === reaction.message.id &&
-        (r.emoji === reaction.emoji.name || r.emoji === reaction.emoji.toString() || r.emoji === `<:${reaction.emoji.name}:${reaction.emoji.id}>`)
-    );
+    // Exact matching: a custom emoji is identified by its ID, never its name.
+    const match = findReactionRole(reactionRolesStore, reaction.message.id, reaction.emoji);
     if (!match) return;
     const guild = reaction.message.guild;
     if (!guild) return;
     try {
+        const role = guild.roles.cache.get(match.roleId) || await guild.roles.fetch(match.roleId).catch(() => null);
+        // Never let a misconfigured mapping hand out a privileged role to
+        // anyone who clicks an emoji.
+        const verdict = canGrantRole(role, { botHighestRole: guild.members.me?.roles?.highest });
+        if (!verdict.allowed) {
+            console.warn(`🛑 Refused reaction role ${match.roleId} for ${user.username}: ${verdict.reason}`);
+            return;
+        }
         const member = await guild.members.fetch(user.id);
+        if (member.roles.cache.has(match.roleId)) return; // already has it
         await member.roles.add(match.roleId);
-        console.log(`🎭 Reaction role: gave ${match.roleId} to ${user.username}`);
+        console.log(`🎭 Reaction role: gave ${role.name} to ${user.username}`);
     } catch(e) { console.log(`⚠️ Reaction role add error: ${e.message}`); }
 });
 
@@ -11916,6 +11958,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
 
     // ── Addon forum 🔥 removal ────────────────────────────────
     if (isAddonThread && reaction.emoji.name === '🔥') {
+        if (!isStarterMessage(reaction.message.id, thread.id)) return;
         const addon = addonRolesStore[thread.id];
         if (!addon) return;
         if (addon.roleId) {
@@ -11933,10 +11976,7 @@ client.on('messageReactionRemove', async (reaction, user) => {
     }
 
     // ── Standard reaction roles ───────────────────────────────
-    const match = reactionRolesStore.find(r =>
-        r.messageId === reaction.message.id &&
-        (r.emoji === reaction.emoji.name || r.emoji === reaction.emoji.toString())
-    );
+    const match = findReactionRole(reactionRolesStore, reaction.message.id, reaction.emoji);
     if (!match) return;
     const guild = reaction.message.guild;
     if (!guild) return;
