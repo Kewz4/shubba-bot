@@ -72,7 +72,7 @@ keybinds and mislabels F8 as "Mirror".
 
 `TAG_CATEGORIES` in `index.js` is no longer a hardcoded list. It is a live view
 over the two forums' `channel.availableTags` (`#🪲│bug-report`
-`1433994315402838127`, `#⁉️│wiki-questions` `1465397633085345914`), refreshed in
+`1433994315402838127`, `#⁉️│wiki-questions` `1541938344324243586`), refreshed in
 the background every 10 minutes. Adding a version tag in Discord is now enough —
 no code change. Pure helpers live in `lib/forum-tags.js` (tested in
 `test/forum-tags.test.js`), including the explicit **5-tags-per-thread cap**
