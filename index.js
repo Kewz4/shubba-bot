@@ -7937,10 +7937,13 @@ async function validatePunchyFiles(message) {
  *   silent — rename + red embed, no ping. THE DEFAULT. Use whenever the signal
  *            is uncertain: anything Shubba caused itself, anything it only
  *            suspects, anything a human will see anyway by reading the forum.
- *   devs   — ping the owners. ONLY when the case is unambiguous and a person
- *            genuinely must act: e.g. the user supplied a video AND full
- *            reproduction context. If you are unsure, it is not certain, and
- *            the answer is silent.
+ *   devs   — ping the owners. Currently UNUSED, and deliberately so: the last
+ *            caller was the "video posted with full reproduction context" path,
+ *            which the owner asked to stop pinging for. The rename plus the red
+ *            embed already surface it to anyone reading the forum. Reach for
+ *            this only if a case appears where a person genuinely must act
+ *            within minutes. If you are unsure, it is not certain, and the
+ *            answer is silent.
  *   mods   — reserved; currently unused. The owner does not want the
  *            Moderator/Helper roles pinged by the bot.
  */
@@ -8615,8 +8618,8 @@ client.on(Events.ThreadCreate, async (thread) => {
                                 tags.some(t => TAG_CATEGORIES.LOADERS.includes(t));
         const hasMeaningfulDescription = (starter.content || '').trim().length >= 30;
         if (hasVideo && hasRequiredTags && hasMeaningfulDescription) { 
-            processingThreads.delete(thread.id); 
-            return await requestHumanHelp(thread, "Video posted with full reproduction context.", 'devs'); 
+            processingThreads.delete(thread.id);
+            return await requestHumanHelp(thread, "Video posted with full reproduction context.", 'silent');
         }
         // If video but missing info, fall through — Shubba will respond and ask for what's missing
         
@@ -9930,7 +9933,7 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
         const hasContext = mem.conversationHistory.length >= 2 ||
             (mem.conversationHistory.length >= 1 && mem.conversationHistory[0].content.trim().length >= 30);
         if (hasVersionTag && hasLoaderTag && hasContext) {
-            return await requestHumanHelp(thread, "Video posted with full reproduction context.", 'devs');
+            return await requestHumanHelp(thread, "Video posted with full reproduction context.", 'silent');
         }
         // Fall through — Shubba will respond and collect the missing info
     }
