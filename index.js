@@ -14,6 +14,23 @@ function shubbaLogError(tag, err) {
         require('fs').appendFileSync('shubba-error.log', line);
     } catch (_) { /* never let logging throw */ }
 }
+
+/**
+ * The one guild Shubba works in — Punchy Guys Studios.
+ *
+ * Nine call sites used to do `client.guilds.cache.first()`, which is only correct
+ * while the bot is in exactly one guild. The moment it was invited to a second
+ * server, `.first()` became insertion-ordered chance: dashboard endpoints and the
+ * addon back-registration on ClientReady could all bind to the wrong guild.
+ *
+ * DEV_GUILD_ID is declared further down the file. That is fine: this function is
+ * only ever CALLED at request/event time, long after module evaluation, so the
+ * const is initialised by then. Falls back to `.first()` if the id cannot be
+ * resolved, so a mis-set id degrades to the old behaviour instead of throwing.
+ */
+function getHomeGuild() {
+    return client.guilds.cache.get(DEV_GUILD_ID) || client.guilds.cache.first();
+}
 process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); shubbaLogError('unhandledRejection', e); });
 process.on('uncaughtException',  (e) => { console.error('uncaughtException:', e);  shubbaLogError('uncaughtException', e); });
 
@@ -387,7 +404,7 @@ const dashboardServer = http.createServer(async (req, res) => {
 
         // GET /api/overview
         if (path === '/api/overview' && req.method === 'GET') {
-            const guild = client.guilds.cache.first();
+            const guild = getHomeGuild();
             const solCount = Object.values(SOLUTIONS_BY_VERSION).reduce((a,v) => a + v.length, 0);
             const threads = Array.from(activeThreadIndex.values()).slice(0, 20).map(t => ({ name: t.title, url: t.url, createdAt: t.createdAt }));
             return sendJSON(res, {
@@ -402,7 +419,7 @@ const dashboardServer = http.createServer(async (req, res) => {
 
         // GET /api/members
         if (path === '/api/members' && req.method === 'GET') {
-            const guild = client.guilds.cache.first();
+            const guild = getHomeGuild();
             if (!guild) return sendJSON(res, { members: [] });
             try {
                 const members = await guild.members.fetch();
@@ -426,7 +443,7 @@ const dashboardServer = http.createServer(async (req, res) => {
 
         // GET /api/moderation — enriched with full warnings + usernames
         if (path === '/api/moderation' && req.method === 'GET') {
-            const guild = client.guilds.cache.first();
+            const guild = getHomeGuild();
             const entries = await Promise.all(Object.entries(moderationData).map(async ([userId, d]) => {
                 let username = 'Unknown';
                 try {
@@ -461,7 +478,7 @@ const dashboardServer = http.createServer(async (req, res) => {
         if (path === '/api/moderation/mute' && req.method === 'POST') {
             const { userId, duration, reason } = parsed;
             if (!userId) return sendJSON(res, { error: 'userId required' }, 400);
-            const guild = client.guilds.cache.first();
+            const guild = getHomeGuild();
             const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
             if (!member) return sendJSON(res, { error: 'Member not found in guild' }, 404);
             await member.timeout(duration || 3600000, reason || 'Muted via dashboard');
@@ -472,7 +489,7 @@ const dashboardServer = http.createServer(async (req, res) => {
         if (path === '/api/moderation/kick' && req.method === 'POST') {
             const { userId, reason } = parsed;
             if (!userId) return sendJSON(res, { error: 'userId required' }, 400);
-            const guild = client.guilds.cache.first();
+            const guild = getHomeGuild();
             const member = guild ? await guild.members.fetch(userId).catch(() => null) : null;
             if (!member) return sendJSON(res, { error: 'Member not found' }, 404);
             const name = member.user.username;
@@ -484,7 +501,7 @@ const dashboardServer = http.createServer(async (req, res) => {
         if (path === '/api/moderation/ban' && req.method === 'POST') {
             const { userId, reason } = parsed;
             if (!userId) return sendJSON(res, { error: 'userId required' }, 400);
-            const guild = client.guilds.cache.first();
+            const guild = getHomeGuild();
             if (!guild) return sendJSON(res, { error: 'Guild not found' }, 500);
             await guild.members.ban(userId, { reason: reason || 'Banned via dashboard' });
             return sendJSON(res, { message: `Banned user ${userId}` });
@@ -785,7 +802,7 @@ const dashboardServer = http.createServer(async (req, res) => {
 
         // GET /api/channels
         if (path === '/api/channels' && req.method === 'GET') {
-            const guild = client.guilds.cache.first();
+            const guild = getHomeGuild();
             if (!guild) return sendJSON(res, { channels: [] });
             const channels = Array.from(guild.channels.cache.values())
                 .filter(c => c.type !== 4) // exclude category channels from the list
@@ -802,7 +819,7 @@ const dashboardServer = http.createServer(async (req, res) => {
         if (path === '/api/channels/create' && req.method === 'POST') {
             const { name, type, topic, nsfw, parentId } = parsed;
             if (!name) return sendJSON(res, { error: 'name required' }, 400);
-            const guild = client.guilds.cache.first();
+            const guild = getHomeGuild();
             if (!guild) return sendJSON(res, { error: 'Guild not found' }, 500);
             const { ChannelType } = require('discord.js');
             const typeMap = {
@@ -1381,6 +1398,26 @@ const FAQ_CHANNEL_ID = '1433994561847562260';        // #faq
 const KNOWN_ISSUES_ID = '1450523790793773240';
 const SUPPORT_FORUM_ID = '1433994315402838127';       // #bug-report
 const WIKI_FORUM_ID = '1541938344324243586';          // #⁉️│wiki-questions (recreated 2026-08-25; old 1465397633085345914 was deleted)
+
+// ── "Inside Access" creator forums ───────────────────────────────────────────
+// These existed for weeks with no code referencing them at all, so Shubba was
+// silent in every one: 16 threads of pack-creator questions got no reply.
+//
+// They are wired to the WIKI path, not the support path, on purpose. The support
+// path gates on a Minecraft-version tag plus a loader tag, and these three forums
+// have NO tags configured — so routing them there would trap every thread behind
+// a gate the author cannot satisfy. The wiki path has no tag gate and carries the
+// pack-authoring knowledge (pack-patterns, the compat/Model Parts reference,
+// punchy-validate) these forums actually need.
+const CREATORS_QUESTIONS_ID   = '1513636313512018142'; // #creators-questions
+const CREATORS_BUG_FORUM_ID   = '1513617297783390350'; // #🪲│creators-bug-report
+// #creators-suggestions is deliberately NOT managed — same as #💡│suggestions,
+// where Shubba has never replied and the owner has not asked it to.
+const CREATORS_SUGGESTIONS_ID = '1513636572959080499'; // eslint-disable-line no-unused-vars
+
+/** Forums that get the wiki-expert treatment: answer directly, no tag gate. */
+const WIKI_STYLE_FORUM_IDS = new Set([WIKI_FORUM_ID, CREATORS_QUESTIONS_ID, CREATORS_BUG_FORUM_ID]);
+const isWikiStyleForum = (parentId) => WIKI_STYLE_FORUM_IDS.has(parentId);
 const ADDON_FORUM_ID = '1491649719431336087';          // #addon-showcase
 const ADDON_PINNED_POST_ID = '1491658199378427986';     // The ONE canonical pinned info post — never recreate
 const ADDON_CREATOR_ROLE_ID = '1445061667775053835';   // Role required to use /createrole
@@ -6277,8 +6314,26 @@ async function loadPausedThreadsFromGCS() {
     } catch(e) { console.log('⚠️ Failed to load paused threads:', e.message); }
 }
 const managedThreads = new Set();
-const processingThreads = new Set(); 
+const processingThreads = new Set();
 const threadMemory = {};
+
+/**
+ * How many times the tag gate has been shown in a thread — threadId -> count.
+ *
+ * The follow-up gate used to fire on EVERY message while tags were missing, with
+ * no memory and no throttle, and it returned early so the user got no answer at
+ * all. Across the last three weeks that produced 102 gate messages over 35
+ * threads; one 10-message thread was 6 of them, another 20-message thread 7.
+ * More than half of Shubba's output in those threads was the same nag, and the
+ * question never got answered.
+ *
+ * So: say it clearly at most TAG_GATE_MAX_NAGS times, then stop gating and help
+ * anyway. A user who has been told twice and still has not tagged is not going
+ * to be convinced by a third copy — at that point the tags are worth less than
+ * an answer, and a dev reading the thread can still see the tags are missing.
+ */
+const tagGateNagCount = new Map();
+const TAG_GATE_MAX_NAGS = 2;
 
 // ============================================================
 // TICKET SYSTEM STATE
@@ -7961,7 +8016,7 @@ async function requestHumanHelp(thread, reason, notify = 'silent') {
             pings = [MOD_ROLE_ID, HELPER_ROLE_ID].filter(Boolean).map(id => `<@&${id}>`).join(' ');
         }
 
-        const isWikiForum = thread.parentId === WIKI_FORUM_ID;
+        const isWikiForum = isWikiStyleForum(thread.parentId);
         const helpType = isWikiForum ? "Wiki question needs human help" : "Support issue needs human help";
         const payload = {
             embeds: [noticeEmbed({
@@ -8012,7 +8067,7 @@ Original: "${bare}"`;
 
 async function solveThread(thread, interactionOrMessage) {
     try {
-        const isWikiForum = thread.parentId === WIKI_FORUM_ID;
+        const isWikiForum = isWikiStyleForum(thread.parentId);
         
         if (isWikiForum) {
             // Wiki threads → distill into custom_knowledge (evergreen, not version-pinned)
@@ -8348,6 +8403,13 @@ function _rawTrigger(d, reason, relevantHistory) {
 
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`✅ Success! Bot is online as ${readyClient.user.tag}`);
+  // The panel gives no console access from automation, so record that the
+  // gateway actually reached READY — and which guilds it sees — in the one file
+  // that can be read back. startup-diag alone fires at require time and proves
+  // nothing about whether the bot ever connected.
+  shubbaLogError('ready-diag', `as ${readyClient.user.tag} | guilds=${
+      readyClient.guilds.cache.map(g => `${g.name}:${g.id}`).join(', ') || 'NONE'
+  } | home=${getHomeGuild()?.name || 'UNRESOLVED'}`);
   console.log(USE_GROQ
     ? `⚡ AI provider: GROQ (${GROQ_MODEL}) — 30 RPM free tier`
     : `💎 AI provider: GEMINI free tier — standard: ${GEMINI_MODEL_STANDARD}, wiki-deep: ${GEMINI_MODEL_WIKI}`);
@@ -8743,6 +8805,9 @@ client.on(Events.ThreadCreate, async (thread) => {
         }
         } else {
             // ── TAGS MISSING: send the gate message, finally block still runs ──
+            // Counts as the first of TAG_GATE_MAX_NAGS so the follow-up path
+            // does not start the count over and ask twice more.
+            tagGateNagCount.set(thread.id, (tagGateNagCount.get(thread.id) || 0) + 1);
             console.log(`🏷️ Thread "${thread.name}" missing required tags. Sending tag request.`);
             await thread.send(tagGateMsg);
         }
@@ -8765,7 +8830,7 @@ client.on(Events.ThreadCreate, async (thread) => {
   }
   
   // Handle wiki forum - Shubba becomes wiki expert with multilingual support
-  if (thread.parentId === WIKI_FORUM_ID && !managedThreads.has(thread.id)) {
+  if (isWikiStyleForum(thread.parentId) && !managedThreads.has(thread.id)) {
     managedThreads.add(thread.id);
     console.log(`📚 New wiki thread created: ${thread.name} (ID: ${thread.id})`);
     
@@ -9204,7 +9269,7 @@ Instructions:
     // This avoids wasting Gemini calls on long support messages from devs
     // ============================================================
     if (isDev && isMentioned && message.channel.isThread && message.channel.isThread() && 
-        (message.channel.parentId === SUPPORT_FORUM_ID || message.channel.parentId === WIKI_FORUM_ID)) {
+        (message.channel.parentId === SUPPORT_FORUM_ID || isWikiStyleForum(message.channel.parentId))) {
         
         const thread = message.channel;
         const messageWithoutMention = message.content.replace(/<@!?\d+>/g, '').trim();
@@ -9336,7 +9401,7 @@ Examples:
         // Shubba responding over the owner mid-conversation. Owners can /resume_bot
         // to bring Shubba back in if needed.
         const isInSupportOrWikiThread = message.channel.isThread && message.channel.isThread() &&
-            (message.channel.parentId === SUPPORT_FORUM_ID || message.channel.parentId === WIKI_FORUM_ID);
+            (message.channel.parentId === SUPPORT_FORUM_ID || isWikiStyleForum(message.channel.parentId));
 
         if (isOwner && isInSupportOrWikiThread && !pausedThreads.has(message.channel.id)) {
             // Don't auto-pause if the owner is mentioning Shubba directly — they want a response
@@ -9785,9 +9850,9 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
         return;
     }
 
-    if (message.channel.parentId !== SUPPORT_FORUM_ID && message.channel.parentId !== WIKI_FORUM_ID) return;
+    if (message.channel.parentId !== SUPPORT_FORUM_ID && !isWikiStyleForum(message.channel.parentId)) return;
     const thread = message.channel;
-    const isWikiForum = thread.parentId === WIKI_FORUM_ID;
+    const isWikiForum = isWikiStyleForum(thread.parentId);
     
     // Check thread state FIRST before doing anything
     const isHumanRequested = thread.name.startsWith('(HUMAN HELP)');
@@ -10060,9 +10125,15 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             // ── TAG GATE (follow-up) ──────────────────────────────────────────
             const tagGateMsgFollowUp = getTagGateMessage(tags);
             if (tagGateMsgFollowUp) {
-                console.log(`🏷️ Follow-up in "${thread.name}" still missing required tags.`);
-                await thread.send(tagGateMsgFollowUp);
-                return;
+                const shown = tagGateNagCount.get(thread.id) || 0;
+                if (shown < TAG_GATE_MAX_NAGS) {
+                    tagGateNagCount.set(thread.id, shown + 1);
+                    console.log(`🏷️ Follow-up in "${thread.name}" still missing tags — reminder ${shown + 1}/${TAG_GATE_MAX_NAGS}.`);
+                    await thread.send(tagGateMsgFollowUp);
+                    return;
+                }
+                // Already asked twice. Stop gating and answer — see tagGateNagCount.
+                console.log(`🏷️ "${thread.name}" still untagged after ${shown} reminders — answering anyway.`);
             }
             // ── END TAG GATE ──────────────────────────────────────────────────
             
@@ -11501,7 +11572,7 @@ async function askGemini(latest, thread, tags, files, data, missing, conversatio
       } else {
           threadContext = `\n[THREAD CONTEXT]\n`;
           threadContext += `Thread Title: ${thread.name}\n`;
-          threadContext += `Forum: ${thread.parentId === WIKI_FORUM_ID ? 'Wiki Questions' : 'Bug Reports/Support'}\n`;
+          threadContext += `Forum: ${isWikiStyleForum(thread.parentId) ? 'Wiki Questions' : 'Bug Reports/Support'}\n`;
           threadContext += `Applied Tags: ${tags.join(', ') || 'None'}\n`;
       }
   }
@@ -12178,7 +12249,7 @@ client.on('guildMemberRemove', async member => {
 // Addon roles + audit run after ready
 client.once(Events.ClientReady, () => {
     loadAddonRolesFromGCS().then(async () => {
-        const guild = client.guilds.cache.first();
+        const guild = getHomeGuild();
         if (guild) {
             // Step 1: Back-register any existing addon threads that aren't in the store yet
             await backRegisterExistingAddons(guild).catch(e => console.log('⚠️ Back-register error:', e.message));
