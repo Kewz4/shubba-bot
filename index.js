@@ -3000,6 +3000,14 @@ const DEFAULT_FAQ_EMBEDS = [
         id: "support",
         title: "❓ Support Channels",
         description: `🐛 **Found a bug?** Report it in <#${SUPPORT_FORUM_ID}>\n💡 **Have an idea?** Post in <#${SUGGESTIONS_CHANNEL_ID}>\n📚 **Wiki questions?** Ask in <#${WIKI_FORUM_ID}>`
+    },
+    {
+        id: "contact",
+        title: "📬 Contact Us",
+        // Support questions belong in the forums, not the inbox — the first line
+        // points people back there so these addresses stay useful for the things
+        // only email can handle.
+        description: `📧 **Questions, partnerships, communication?**\ninfo@punchymod.com\n\n⚖️ **DMCA, copyright, legal reports?**\nreport@punchymod.com\n\n*For mod support and bug reports, please use the channels above — you'll get a much faster answer there.*`
     }
 ];
 
