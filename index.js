@@ -1399,25 +1399,10 @@ const KNOWN_ISSUES_ID = '1450523790793773240';
 const SUPPORT_FORUM_ID = '1433994315402838127';       // #bug-report
 const WIKI_FORUM_ID = '1541938344324243586';          // #⁉️│wiki-questions (recreated 2026-08-25; old 1465397633085345914 was deleted)
 
-// ── "Inside Access" creator forums ───────────────────────────────────────────
-// These existed for weeks with no code referencing them at all, so Shubba was
-// silent in every one: 16 threads of pack-creator questions got no reply.
-//
-// They are wired to the WIKI path, not the support path, on purpose. The support
-// path gates on a Minecraft-version tag plus a loader tag, and these three forums
-// have NO tags configured — so routing them there would trap every thread behind
-// a gate the author cannot satisfy. The wiki path has no tag gate and carries the
-// pack-authoring knowledge (pack-patterns, the compat/Model Parts reference,
-// punchy-validate) these forums actually need.
-const CREATORS_QUESTIONS_ID   = '1513636313512018142'; // #creators-questions
-const CREATORS_BUG_FORUM_ID   = '1513617297783390350'; // #🪲│creators-bug-report
-// #creators-suggestions is deliberately NOT managed — same as #💡│suggestions,
-// where Shubba has never replied and the owner has not asked it to.
-const CREATORS_SUGGESTIONS_ID = '1513636572959080499'; // eslint-disable-line no-unused-vars
-
-/** Forums that get the wiki-expert treatment: answer directly, no tag gate. */
-const WIKI_STYLE_FORUM_IDS = new Set([WIKI_FORUM_ID, CREATORS_QUESTIONS_ID, CREATORS_BUG_FORUM_ID]);
-const isWikiStyleForum = (parentId) => WIKI_STYLE_FORUM_IDS.has(parentId);
+// The three "Inside Access" creator forums (#creators-questions 1513636313512018142,
+// #🪲│creators-bug-report 1513617297783390350, #creators-suggestions 1513636572959080499)
+// are DELIBERATELY not handled here. They were briefly wired to the wiki path and the
+// owner asked for them to stay AI-free — creators talk to humans there. Do not add them.
 const ADDON_FORUM_ID = '1491649719431336087';          // #addon-showcase
 const ADDON_PINNED_POST_ID = '1491658199378427986';     // The ONE canonical pinned info post — never recreate
 const ADDON_CREATOR_ROLE_ID = '1445061667775053835';   // Role required to use /createrole
@@ -8016,7 +8001,7 @@ async function requestHumanHelp(thread, reason, notify = 'silent') {
             pings = [MOD_ROLE_ID, HELPER_ROLE_ID].filter(Boolean).map(id => `<@&${id}>`).join(' ');
         }
 
-        const isWikiForum = isWikiStyleForum(thread.parentId);
+        const isWikiForum = thread.parentId === WIKI_FORUM_ID;
         const helpType = isWikiForum ? "Wiki question needs human help" : "Support issue needs human help";
         const payload = {
             embeds: [noticeEmbed({
@@ -8067,7 +8052,7 @@ Original: "${bare}"`;
 
 async function solveThread(thread, interactionOrMessage) {
     try {
-        const isWikiForum = isWikiStyleForum(thread.parentId);
+        const isWikiForum = thread.parentId === WIKI_FORUM_ID;
         
         if (isWikiForum) {
             // Wiki threads → distill into custom_knowledge (evergreen, not version-pinned)
@@ -8830,7 +8815,7 @@ client.on(Events.ThreadCreate, async (thread) => {
   }
   
   // Handle wiki forum - Shubba becomes wiki expert with multilingual support
-  if (isWikiStyleForum(thread.parentId) && !managedThreads.has(thread.id)) {
+  if (thread.parentId === WIKI_FORUM_ID && !managedThreads.has(thread.id)) {
     managedThreads.add(thread.id);
     console.log(`📚 New wiki thread created: ${thread.name} (ID: ${thread.id})`);
     
@@ -9269,7 +9254,7 @@ Instructions:
     // This avoids wasting Gemini calls on long support messages from devs
     // ============================================================
     if (isDev && isMentioned && message.channel.isThread && message.channel.isThread() && 
-        (message.channel.parentId === SUPPORT_FORUM_ID || isWikiStyleForum(message.channel.parentId))) {
+        (message.channel.parentId === SUPPORT_FORUM_ID || message.channel.parentId === WIKI_FORUM_ID)) {
         
         const thread = message.channel;
         const messageWithoutMention = message.content.replace(/<@!?\d+>/g, '').trim();
@@ -9401,7 +9386,7 @@ Examples:
         // Shubba responding over the owner mid-conversation. Owners can /resume_bot
         // to bring Shubba back in if needed.
         const isInSupportOrWikiThread = message.channel.isThread && message.channel.isThread() &&
-            (message.channel.parentId === SUPPORT_FORUM_ID || isWikiStyleForum(message.channel.parentId));
+            (message.channel.parentId === SUPPORT_FORUM_ID || message.channel.parentId === WIKI_FORUM_ID);
 
         if (isOwner && isInSupportOrWikiThread && !pausedThreads.has(message.channel.id)) {
             // Don't auto-pause if the owner is mentioning Shubba directly — they want a response
@@ -9850,9 +9835,9 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
         return;
     }
 
-    if (message.channel.parentId !== SUPPORT_FORUM_ID && !isWikiStyleForum(message.channel.parentId)) return;
+    if (message.channel.parentId !== SUPPORT_FORUM_ID && message.channel.parentId !== WIKI_FORUM_ID) return;
     const thread = message.channel;
-    const isWikiForum = isWikiStyleForum(thread.parentId);
+    const isWikiForum = thread.parentId === WIKI_FORUM_ID;
     
     // Check thread state FIRST before doing anything
     const isHumanRequested = thread.name.startsWith('(HUMAN HELP)');
@@ -11572,7 +11557,7 @@ async function askGemini(latest, thread, tags, files, data, missing, conversatio
       } else {
           threadContext = `\n[THREAD CONTEXT]\n`;
           threadContext += `Thread Title: ${thread.name}\n`;
-          threadContext += `Forum: ${isWikiStyleForum(thread.parentId) ? 'Wiki Questions' : 'Bug Reports/Support'}\n`;
+          threadContext += `Forum: ${thread.parentId === WIKI_FORUM_ID ? 'Wiki Questions' : 'Bug Reports/Support'}\n`;
           threadContext += `Applied Tags: ${tags.join(', ') || 'None'}\n`;
       }
   }
