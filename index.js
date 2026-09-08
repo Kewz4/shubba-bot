@@ -71,6 +71,8 @@ const { splitMessage, answerEmbeds, noticeEmbed, modActionEmbed, noPing, stripMe
 const { shouldReplyInThread } = require('./lib/reply-gate');
 // Deterministic schema check for creator files — cannot hallucinate a rule.
 const { validate: validatePunchyFile } = require('./lib/punchy-validate');
+// Reads .zip resource packs using Node's zlib — no new dependency.
+const { inspectResourcePack } = require('./lib/zip-reader');
 // Version-aware solution memory: detect, distil, dedupe, rank.
 const {
     distil: distilSolution,
@@ -7852,10 +7854,13 @@ async function applyTagsFromConversation(message, thread) {
 // that would have caught the "override useItem to stop the bow draw" answer.
 
 const VALIDATE_MAX_BYTES = 400 * 1024;
+// Resource packs are legitimately large; the reader caps what it inflates.
+const VALIDATE_MAX_ZIP_BYTES = 25 * 1024 * 1024;
 
 /** Pull candidate Punchy files out of a message: code blocks + .json attachments. */
 async function extractPunchyFiles(message) {
     const files = [];
+    const packSummaries = [];
 
     // Fenced blocks, json-tagged or not — creators forget the tag constantly.
     const fence = /```(?:json|jsonc|js)?\s*\n([\s\S]*?)```/g;
@@ -7867,6 +7872,33 @@ async function extractPunchyFiles(message) {
 
     for (const att of (message.attachments?.values() ? Array.from(message.attachments.values()) : [])) {
         const n = String(att.name || '').toLowerCase();
+
+        // A .zip is a whole resource pack. Shubba used to log
+        // "Attached: pack.zip (unknown type)" and then answer blind about a
+        // file it was literally holding — read it instead.
+        if (n.endsWith('.zip')) {
+            if ((att.size || 0) > VALIDATE_MAX_ZIP_BYTES) {
+                console.log(`⚠️ Skipping ${att.name}: ${Math.round((att.size||0)/1048576)}MB exceeds the read limit`);
+                continue;
+            }
+            try {
+                const res = await axios.get(att.url, { timeout: 30000, responseType: 'arraybuffer' });
+                const pack = inspectResourcePack(Buffer.from(res.data));
+                if (!pack.ok) {
+                    console.log(`⚠️ ${att.name} is not a readable zip: ${pack.warnings.join(' ')}`);
+                    continue;
+                }
+                packSummaries.push({ name: att.name, pack });
+                for (const pf of pack.files) {
+                    if (pf.text) files.push({ name: `${att.name} → ${pf.name}`, text: pf.text });
+                }
+                console.log(`📦 Read ${att.name}: ${pack.counts.total} entries, ${pack.files.length} Punchy files`);
+            } catch (e) {
+                console.log(`⚠️ Could not read zip ${att.name}: ${e.message}`);
+            }
+            continue;
+        }
+
         if (!/\.(json|mcmeta)$/.test(n)) continue;
         if ((att.size || 0) > VALIDATE_MAX_BYTES) continue;
         try {
@@ -7876,6 +7908,7 @@ async function extractPunchyFiles(message) {
             console.log(`⚠️ Could not fetch attachment ${att.name}: ${e.message}`);
         }
     }
+    files.packSummaries = packSummaries;
     return files;
 }
 
@@ -7890,7 +7923,7 @@ async function validatePunchyFiles(message) {
     if (!files.length) return false;
 
     let hadErrors = false;
-    for (const f of files.slice(0, 3)) {
+    for (const f of files.slice(0, 8)) {
         let result;
         try { result = validatePunchyFile(f.text, { filename: f.name }); }
         catch (e) { console.log('[validate] threw on', f.name, e.message); continue; }
