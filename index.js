@@ -7741,6 +7741,55 @@ async function registerCommands() {
  */
 
 
+/**
+ * Fit a log into the prompt WITHOUT lying about what was cut.
+ *
+ * The old code did `text.substring(0, 50000)` and wrapped the result in
+ * "--- END OF LOG ---". Two things went wrong with that, both seen in
+ * production:
+ *   1. It kept the HEAD. A crash or a hang is at the END of a log, so the part
+ *      that mattered was exactly the part thrown away.
+ *   2. It labelled its own cut "END OF LOG", so Shubba told a user their game
+ *      hung because the log "stops" mid-line. It was reading its own
+ *      truncation artifact as evidence and diagnosing from it.
+ *
+ * So: keep the tail, keep enough head for the boot banner (versions, loader,
+ * mod list), and state plainly that the middle is missing.
+ */
+function fitLogForPrompt(text, label, limit = 50000) {
+    const full = String(text == null ? '' : text);
+    if (full.length <= limit) {
+        return '\n--- ' + label + ' (complete, ' + full.length + ' chars) ---\n'
+            + full + '\n--- END OF ' + label + ' ---\n';
+    }
+
+    const headBudget = Math.floor(limit * 0.25);
+    const tailBudget = limit - headBudget;
+    const head = full.slice(0, headBudget);
+    const tail = full.slice(full.length - tailBudget);
+    const omitted = full.length - headBudget - tailBudget;
+
+    return [
+        '',
+        '--- ' + label + ' (TRUNCATED - ' + full.length + ' chars total) ---',
+        '[!] This log was too long to include whole. You are seeing the FIRST '
+            + headBudget + ' characters and the LAST ' + tailBudget + '. '
+            + omitted + ' characters in the MIDDLE ARE MISSING.',
+        '[!] Do NOT infer anything from where either section begins or ends.'
+            + ' The log does NOT end where this excerpt ends - that boundary is'
+            + ' our size limit, not the game\'s last line. Never say the game'
+            + ' hung, froze or stopped on the basis of where this text stops.',
+        '--- FIRST ' + headBudget + ' CHARACTERS ---',
+        head,
+        '--- [' + omitted + ' CHARACTERS OMITTED FROM THE MIDDLE] ---',
+        '--- LAST ' + tailBudget + ' CHARACTERS (this is the real end of the file) ---',
+        tail,
+        '--- END OF EXCERPT ---',
+        '',
+    ].join('\n');
+}
+
+
 async function analyzeAttachments(message, threadId) {
     let details = "";
     let logContent = "";
@@ -7755,7 +7804,7 @@ async function analyzeAttachments(message, threadId) {
         for (const url of logUrls) {
             const fetchedLog = await fetchLogFromUrl(url);
             if (fetchedLog) {
-                logContent += `\n--- START OF LOG FROM: ${url} ---\n${fetchedLog.substring(0, 50000)}\n--- END OF LOG ---\n`;
+                logContent += fitLogForPrompt(fetchedLog, `LOG FROM ${url}`);
                 memory.hasLog = true;
             }
         }
@@ -7823,7 +7872,7 @@ async function analyzeAttachments(message, threadId) {
                     text = buffer.toString('utf8');
                 }
                 const label = isLog ? 'LOG/CRASH FILE' : isModlist ? 'MODLIST FILE' : 'FILE CONTENTS';
-                logContent += `\n--- ${label}: ${attachment.name} ---\n${text.substring(0, 50000)}\n--- END OF ${attachment.name} ---\n`;
+                logContent += fitLogForPrompt(text, `${label}: ${attachment.name}`);
                 details += `  → READ CONTENTS (${text.length} chars)\n`;
             } catch (e) { 
                 console.log(`⚠️ Failed to read attachment: ${attachment.name}`, e.message);
