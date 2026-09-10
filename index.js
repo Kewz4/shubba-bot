@@ -90,6 +90,11 @@ const { shouldReplyInThread } = require('./lib/reply-gate');
 const { validate: validatePunchyFile } = require('./lib/punchy-validate');
 // Reads .zip resource packs using Node's zlib — no new dependency.
 const { inspectResourcePack } = require('./lib/zip-reader');
+// Logs are their own format problem: they arrive gzipped, they arrive in UTF-16
+// from Windows tooling, they arrive far too big for a prompt, and the facts that
+// matter (version, loader, failing mixin) are scattered across the whole file
+// rather than the part that fits. This reads them properly.
+const { analyzeLog, isLikelyLog } = require('./lib/log-analyzer');
 // Version-aware solution memory: detect, distil, dedupe, rank.
 const {
     distil: distilSolution,
@@ -2314,15 +2319,6 @@ MOD COMPATIBILITY POLICY (IMPORTANT):
   3. Direct them to post a suggestion in <#${SUGGESTIONS_CHANNEL_ID}> if they'd like official compat added
   4. Do NOT mark this as a bug or tell them to file a bug report
 
-DEV/OWNER KNOWLEDGE (share with owners kewz. and PunchyMan only — never with regular users):
-- Architecture: state machine per action (AttackStateMachine, MiningStateMachine, UseItemStateMachine, BowStateMachine, CrossbowStateMachine, SpearStateMachine, TridentStateMachine, ShieldStateMachine, ConsumeStateMachine, ClimbStateMachine, CrawlStateMachine, SwimmingStateMachine, FallingStateMachine, InspectStateMachine, TriggerableStateMachine, BoatPaddleStateMachine, BoatRowingStateMachine, WakeUpStateMachine, MovementStateMachine, MudStateMachine, SweatStateMachine, FireStateMachine, HandEquipStateMachine)
-- Core classes: PunchyClient (entry point, holds all state machine singletons), PunchyAnimationManager (loads/resolves animation clips from packs, manages Mix Pack system), PoseHandler (applies animation transforms to model parts), ItemAnimationManager and BedrockItemAnimationManager (handle per-item Bedrock-format animations)
-- Animation expression language: custom parser in AnimationExpression supporting arithmetic, variables, and functions similar to Bedrock molang
-- Tuning system: TuningProfileManager manages profiles; config data in PunchyTuningConfig with complex nested structure (GroupEntry, SpecificEntry, SideSet, MixSlotDef, MixSlotPayload, MixCatalog)
-- Mixins applied: ModelPartMixin, CancelSwingMixin, LivingEntitySwingMixin, MinecraftMixin, ItemInHandRendererMixin, AvatarRendererMixin, LivingEntityRendererMixin, CameraMixin, GameRendererMixin, LevelRendererMixin, and many accessor/invoker mixins
-- Custom render layers: VanillaFirstPersonItemLayer (main first-person item rendering), PlayerArmModelLayer (arm model rendering), ArmMeshTuning, ArmToolTuning
-- BedrockItemSystem handles custom geo/model rendering for special items using Bedrock format geometry JSON
-
 ════════════════════════════════════════════════════════════
 OFFICIAL ADDONS
 ════════════════════════════════════════════════════════════
@@ -2392,6 +2388,32 @@ PUNCHY! x TINY TAKEOVER (punchy_puppies mod):
   - "Wolves won't respond to whistle": wolves must be YOUR owned baby wolves; wild wolves and adult wolves are not supported
   - "Mod crashes on startup": confirm the loader's API is installed (Fabric API on Fabric) and they're on a supported MC version; Forge 1.20.1 / NeoForge 1.21.1 startup crashes were fixed in Punchy 2.6.1 — update Punchy first
 ` + PUNCHY_VERIFIED_KNOWLEDGE;
+
+/**
+ * Internal architecture notes — class names, state machines, mixins.
+ *
+ * This used to live INSIDE PUNCHY_STATIC_KNOWLEDGE, which is injected into
+ * every public support and wiki prompt, carrying only a prose label saying
+ * "share with owners only". That is a request, not a control: the model was
+ * handed the internals on every public question and asked to remember not to
+ * repeat them. It is now appended by CODE, and only when the asker is
+ * actually an owner — see ownerKnowledge().
+ */
+const PUNCHY_DEV_INTERNALS = `
+DEV/OWNER KNOWLEDGE (share with owners kewz. and PunchyMan only — never with regular users):
+- Architecture: state machine per action (AttackStateMachine, MiningStateMachine, UseItemStateMachine, BowStateMachine, CrossbowStateMachine, SpearStateMachine, TridentStateMachine, ShieldStateMachine, ConsumeStateMachine, ClimbStateMachine, CrawlStateMachine, SwimmingStateMachine, FallingStateMachine, InspectStateMachine, TriggerableStateMachine, BoatPaddleStateMachine, BoatRowingStateMachine, WakeUpStateMachine, MovementStateMachine, MudStateMachine, SweatStateMachine, FireStateMachine, HandEquipStateMachine)
+- Core classes: PunchyClient (entry point, holds all state machine singletons), PunchyAnimationManager (loads/resolves animation clips from packs, manages Mix Pack system), PoseHandler (applies animation transforms to model parts), ItemAnimationManager and BedrockItemAnimationManager (handle per-item Bedrock-format animations)
+- Animation expression language: custom parser in AnimationExpression supporting arithmetic, variables, and functions similar to Bedrock molang
+- Tuning system: TuningProfileManager manages profiles; config data in PunchyTuningConfig with complex nested structure (GroupEntry, SpecificEntry, SideSet, MixSlotDef, MixSlotPayload, MixCatalog)
+- Mixins applied: ModelPartMixin, CancelSwingMixin, LivingEntitySwingMixin, MinecraftMixin, ItemInHandRendererMixin, AvatarRendererMixin, LivingEntityRendererMixin, CameraMixin, GameRendererMixin, LevelRendererMixin, and many accessor/invoker mixins
+- Custom render layers: VanillaFirstPersonItemLayer (main first-person item rendering), PlayerArmModelLayer (arm model rendering), ArmMeshTuning, ArmToolTuning
+- BedrockItemSystem handles custom geo/model rendering for special items using Bedrock format geometry JSON
+`;
+
+/** The dev block, but only for owners. Everyone else gets an empty string. */
+function ownerKnowledge(isOwnerQuery) {
+    return isOwnerQuery ? PUNCHY_DEV_INTERNALS : '';
+}
 
 // GCS file for owner-taught custom knowledge entries
 const CUSTOM_KNOWLEDGE_FILE_NAME = 'custom_knowledge.json';
@@ -3957,7 +3979,8 @@ async function handleIsolateCommand(interaction) {
     // Send chunks if the summary is very long
     const chunks = splitMessage(openingMessage);
     for (const chunk of chunks) {
-        await ticketChannel.send(chunk);
+        // A human opened this ticket deliberately — notify the owners and the OP.
+        await ticketChannel.send({ content: chunk, allowedMentions: { users: [...DEV_IDS, ...(opId ? [opId] : [])] } });
     }
 
     // Also tag the thread with a note pointing to the ticket
@@ -4222,7 +4245,8 @@ async function handleRepliedCommand(interaction) {
         `⏰ **Please reply within 48 hours** — if we don't hear back, this post will be automatically archived due to inactivity. You can always open a new post if the issue persists!`
     ].join('\n');
 
-    await safeReply(interaction, msg);
+    // Opt back in: the OP must actually be notified about their own post.
+    await safeReply(interaction, { content: msg, allowedMentions: { users: opId ? [opId] : [] } });
 
     // Set the 48-hour auto-archive timer
     const FORTY_EIGHT_HOURS = 48 * 60 * 60 * 1000;
@@ -4321,7 +4345,8 @@ async function handleWarning1Command(interaction) {
         `Please update your post with the missing information. If we don't receive it, a second warning will result in the post being archived.`
     ].join('\n');
 
-    await safeReply(interaction, msg);
+    // Opt back in: the OP must actually be notified about their own post.
+    await safeReply(interaction, { content: msg, allowedMentions: { users: opId ? [opId] : [] } });
     console.log(`⚠️ Warning 1 sent in thread: ${thread.name}`);
 }
 
@@ -4359,7 +4384,8 @@ async function handleWarning2Command(interaction) {
         `We're happy to help once we have what we need to reproduce the problem. 👋`
     ].join('\n');
 
-    await safeReply(interaction, closingMsg);
+    // Opt back in: the OP must hear that their post was archived.
+    await safeReply(interaction, { content: closingMsg, allowedMentions: { users: opId ? [opId] : [] } });
 
     // Archive immediately after sending the message
     try {
@@ -6313,6 +6339,38 @@ const processingThreads = new Set();
 const threadMemory = {};
 
 /**
+ * Threads whose STARTER post has already been answered — threadId.
+ *
+ * processingThreads is a mutex, not a dedupe: it is released the moment the
+ * work finishes, so it says "not being handled right now", never "already
+ * handled". Discord delivers a forum post as BOTH a THREAD_CREATE and a
+ * MESSAGE_CREATE, and the ThreadCreate side waits 4 seconds before it even
+ * fetches the starter. An answer that takes 2 seconds has therefore come and
+ * gone — lock taken, lock released — before the timer wakes up and finds the
+ * coast clear, so the same post gets answered twice from two independently
+ * sampled generations. Users saw the tag gate twice ~3 seconds apart, and two
+ * contradictory Deep Analysis reports on one bug.
+ *
+ * This Set is the thing that actually remembers. It is claimed BEFORE any
+ * await and never released; cleanupOldMemories evicts it by age.
+ */
+const answeredStarters = new Set();
+
+/**
+ * Threads already escalated to a human — threadId.
+ *
+ * requestHumanHelp() used to test `thread.name.startsWith('(HUMAN HELP)')`,
+ * which is only true once setName() has completed a REST round-trip. Discord
+ * caps thread renames at 2 per 10 minutes, so that call can sit queued for
+ * minutes while further escalations sail past the check. Claimed synchronously
+ * here instead.
+ */
+const escalatedThreads = new Set();
+
+/** threadId -> ms when it was escalated, for the 24h unanswered sweep. */
+const escalationOpenedAt = new Map();
+
+/**
  * How many times the tag gate has been shown in a thread — threadId -> count.
  *
  * The follow-up gate used to fire on EVERY message while tags were missing, with
@@ -6943,13 +7001,62 @@ function extractUserInfo(threadId, content) {
 function cleanupOldMemories() {
     const ONE_WEEK = 7 * 24 * 60 * 60 * 1000;
     const now = Date.now();
-    
+
     Object.keys(threadMemory).forEach(threadId => {
         if (now - threadMemory[threadId].lastUpdateTime > ONE_WEEK) {
             delete threadMemory[threadId];
         }
     });
+
+    // The per-thread bookkeeping Sets/Maps grow forever otherwise — a bot that
+    // stays up for months accumulates an entry per thread it has ever seen.
+    // A thread untouched for a week is settled; forget it.
+    const stale = (threadId) => {
+        const mem = threadMemory[threadId];
+        return !mem || now - mem.lastUpdateTime > ONE_WEEK;
+    };
+    for (const id of [...answeredStarters]) if (stale(id)) answeredStarters.delete(id);
+    for (const id of [...escalatedThreads]) if (stale(id)) escalatedThreads.delete(id);
+    for (const id of [...tagGateNagCount.keys()]) if (stale(id)) tagGateNagCount.delete(id);
+    for (const [id, at] of escalationOpenedAt) if (now - at > ONE_WEEK) escalationOpenedAt.delete(id);
+    for (const id of [...managedThreads]) if (stale(id)) managedThreads.delete(id);
 }
+
+/**
+ * Escalated threads that nobody has answered in 24 hours.
+ *
+ * Escalation was a dead end: the thread was renamed, a red embed went up, and
+ * from then on Shubba answered only if directly tagged. Nothing notified a
+ * human and nothing ever came back to check. One user wrote "Waiting" and got
+ * fourteen days of silence. This is the thing that comes back to check.
+ *
+ * Still no pings — it posts a record in the dev channel, once, then forgets it.
+ */
+const ESCALATION_STALE_MS = 24 * 60 * 60 * 1000;
+
+async function sweepStaleEscalations() {
+    const now = Date.now();
+    for (const [threadId, at] of [...escalationOpenedAt]) {
+        if (now - at < ESCALATION_STALE_MS) continue;
+        escalationOpenedAt.delete(threadId);   // report once, not hourly
+        try {
+            const thread = await client.channels.fetch(threadId).catch(() => null);
+            if (!thread || thread.archived) continue;
+            if (!thread.name.startsWith('(HUMAN HELP)')) continue;   // someone dealt with it
+
+            // If a human has posted since the escalation, it is being handled.
+            const recent = await thread.messages.fetch({ limit: 10 }).catch(() => null);
+            const humanReplied = recent && [...recent.values()].some(m =>
+                !m.author.bot && m.createdTimestamp > at);
+            if (humanReplied) continue;
+
+            await postEscalationRecord(thread, 'No staff reply since it was escalated.', 'silent', true);
+        } catch (e) {
+            console.log('⚠️ Escalation sweep error:', e.message);
+        }
+    }
+}
+setInterval(() => { sweepStaleEscalations().catch(() => {}); }, 60 * 60 * 1000);
 
 setInterval(cleanupOldMemories, 6 * 60 * 60 * 1000);
 
@@ -7837,7 +7944,21 @@ async function analyzeAttachments(message, threadId) {
         ) {
             hasImage = true;
             details += `  → IMAGE FILE detected: ${attachment.url}\n`;
-            logContent += `\n--- IMAGE ATTACHED: ${attachment.name} ---\nURL: ${attachment.url}\nThe user has attached a screenshot/image. Acknowledge that you can see it and respond accordingly.\n--- END IMAGE ---\n`;
+            // Shubba has NO vision. Nothing downloads or decodes this image —
+            // only the filename and URL reach the model. The old wording here
+            // told it to "acknowledge that you can see it and respond
+            // accordingly", so it confidently described screenshots it had
+            // never received and diagnosed from invented detail. Say what is
+            // actually true and tell it what to do instead.
+            logContent += `\n--- IMAGE ATTACHED: ${attachment.name} ---\n`
+                + `URL: ${attachment.url}\n`
+                + `[!] YOU CANNOT SEE THIS IMAGE. You have its filename only — no pixels, no vision.\n`
+                + `[!] NEVER describe, quote, or diagnose from its contents. Do not say "I can see",\n`
+                + `    "in your screenshot", or anything implying you viewed it.\n`
+                + `[!] Do this instead: say plainly that you cannot read images, and ask for the\n`
+                + `    thing you CAN read — the latest.log / crash-report file, or the error text\n`
+                + `    pasted as text. If the rest of their message is enough to answer, just answer.\n`
+                + `--- END IMAGE ---\n`;
         }
 
         const isLog = nameLower.includes('log') || nameLower.includes('crash');
@@ -7863,17 +7984,45 @@ async function analyzeAttachments(message, threadId) {
                     maxContentLength: 50 * 1024 * 1024
                 });
                 const buffer = Buffer.from(response.data);
-                let text;
-                if (buffer.length >= 2 && ((buffer[0] === 0xFF && buffer[1] === 0xFE) || (buffer[0] === 0xFE && buffer[1] === 0xFF))) {
-                    text = buffer.toString('utf16le');
-                } else if (buffer.includes(0x00)) {
-                    text = buffer.toString('utf16le');
+
+                if (isLikelyLog(attachment.name, contentType)) {
+                    // Minecraft ships `latest.log.gz`, and the old code matched it
+                    // on `name.includes('log')` and then did buffer.toString('utf8')
+                    // — so the model was handed a screenful of gzip mojibake and
+                    // asked to diagnose from it. The analyzer gunzips first, reads
+                    // the facts out of the WHOLE file (not just the part that fits
+                    // in the prompt), and keeps the TAIL, where crashes live.
+                    const { facts, summary, meta } = analyzeLog(buffer, attachment.name);
+                    logContent += summary;
+
+                    const bits = [];
+                    if (facts.minecraftVersion) bits.push(`MC ${facts.minecraftVersion}`);
+                    if (facts.loader) bits.push(facts.loader);
+                    if (facts.punchyVersion) bits.push(`Punchy ${facts.punchyVersion}`);
+                    if (facts.mods?.length) bits.push(`${facts.mods.length} mods`);
+                    if (facts.crashed) bits.push(`CRASH: ${facts.exceptionType || 'unknown'}`);
+                    if (facts.failingMod) bits.push(`blames ${facts.failingMod}`);
+                    details += `  → LOG PARSED${bits.length ? ` (${bits.join(', ')})` : ''}\n`;
+                    if (meta?.gzip) details += `  → gzip decompressed\n`;
+
+                    // Feed the parsed facts into thread memory so the tag gate and
+                    // the prompt both know them. Without this the version sat in a
+                    // local variable while Shubba asked the user for it.
+                    if (facts.minecraftVersion && !memory.userInfo.version) memory.userInfo.version = facts.minecraftVersion;
+                    if (facts.loader && !memory.userInfo.loader) memory.userInfo.loader = facts.loader;
                 } else {
-                    text = buffer.toString('utf8');
+                    let text;
+                    if (buffer.length >= 2 && ((buffer[0] === 0xFF && buffer[1] === 0xFE) || (buffer[0] === 0xFE && buffer[1] === 0xFF))) {
+                        text = buffer.toString('utf16le');
+                    } else if (buffer.includes(0x00)) {
+                        text = buffer.toString('utf16le');
+                    } else {
+                        text = buffer.toString('utf8');
+                    }
+                    const label = isModlist ? 'MODLIST FILE' : 'FILE CONTENTS';
+                    logContent += fitLogForPrompt(text, `${label}: ${attachment.name}`);
+                    details += `  → READ CONTENTS (${text.length} chars)\n`;
                 }
-                const label = isLog ? 'LOG/CRASH FILE' : isModlist ? 'MODLIST FILE' : 'FILE CONTENTS';
-                logContent += fitLogForPrompt(text, `${label}: ${attachment.name}`);
-                details += `  → READ CONTENTS (${text.length} chars)\n`;
             } catch (e) { 
                 console.log(`⚠️ Failed to read attachment: ${attachment.name}`, e.message);
                 logContent += `\n--- FILE: ${attachment.name} (Failed to read: ${e.message}) ---\n`;
@@ -8078,11 +8227,21 @@ async function validatePunchyFiles(message) {
  *            Moderator/Helper roles pinged by the bot.
  */
 async function requestHumanHelp(thread, reason, notify = 'silent') {
-    if (thread.name.startsWith('(HUMAN HELP)')) return;
+    // Guard on LOCAL state, claimed synchronously. The name check alone is a
+    // race: the "(HUMAN HELP)" prefix only exists after setName() completes,
+    // and Discord rate-limits thread renames to 2 per 10 minutes, so discord.js
+    // can hold that request queued for minutes. Every escalation arriving in
+    // that window passed the check and posted another identical red embed.
+    if (escalatedThreads.has(thread.id) || thread.name.startsWith('(HUMAN HELP)')) return;
+    escalatedThreads.add(thread.id);
     try {
         const cleanName = thread.name.replace('[SOLVED] ', '');
         const truncated = ('(HUMAN HELP) ' + cleanName).substring(0, 100);
-        await thread.setName(truncated);
+        // A rename that fails must NOT swallow the notice. Previously a throw
+        // here jumped to the catch, so the thread was neither renamed nor
+        // flagged and nobody was told anything at all.
+        await thread.setName(truncated)
+            .catch(e => console.warn(`⚠️ Could not rename escalated thread: ${e.message}`));
 
         let pings = '';
         if (notify === 'devs') {
@@ -8108,7 +8267,77 @@ async function requestHumanHelp(thread, reason, notify = 'silent') {
         // the IDs we just built. Everything else Shubba sends is mention-free.
         await thread.send(noPing(payload, notify === 'devs' ? { users: DEV_IDS } : undefined));
         console.log(`🚩 Flagged "${thread.name}" (notify=${notify}) — ${reason}`);
-    } catch (e) { console.error("Failed to flag thread:", e); }
+
+        // A silent escalation still has to land somewhere a human will look.
+        // Until now 'silent' meant the thread was renamed, a red embed was
+        // posted, and NOTHING else happened: no staff notice, no queue, no
+        // sweep. Combined with the mention-only mute below it, threads simply
+        // died — one user waited fourteen days after writing "Waiting".
+        //
+        // This is a record, not a ping: it goes to the dev channel with
+        // mentions disabled, so nobody's phone buzzes and nothing is lost.
+        escalationOpenedAt.set(thread.id, Date.now());
+        await postEscalationRecord(thread, reason, notify);
+    } catch (e) {
+        escalatedThreads.delete(thread.id);   // let a retry through
+        console.error("Failed to flag thread:", e);
+    }
+}
+
+/**
+ * Escalate a video report, but only once the user has stopped posting.
+ *
+ * Called on every qualifying message; each call cancels the pending timer and
+ * starts a new one, so escalation fires VIDEO_SETTLE_MS after the LAST message
+ * rather than immediately after the first. Someone mid-upload keeps the thread
+ * live instead of watching it go quiet on them.
+ */
+const VIDEO_SETTLE_MS = 90 * 1000;
+const pendingVideoEscalations = new Map();   // threadId -> Timeout
+
+function scheduleVideoEscalation(thread) {
+    const existing = pendingVideoEscalations.get(thread.id);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(async () => {
+        pendingVideoEscalations.delete(thread.id);
+        try {
+            // Re-fetch: the thread may have been solved, paused or escalated
+            // while we waited, in which case there is nothing to do.
+            const fresh = await client.channels.fetch(thread.id).catch(() => null);
+            if (!fresh || fresh.archived) return;
+            if (pausedThreads.has(fresh.id)) return;
+            if (fresh.name.startsWith('(HUMAN HELP)') || fresh.name.startsWith('[SOLVED]')) return;
+            await requestHumanHelp(fresh, "Video posted with full reproduction context.", 'silent');
+        } catch (e) {
+            console.log('⚠️ Deferred video escalation failed:', e.message);
+        }
+    }, VIDEO_SETTLE_MS);
+
+    if (timer.unref) timer.unref();
+    pendingVideoEscalations.set(thread.id, timer);
+    console.log(`🎥 Video escalation for "${thread.name}" queued — waiting ${VIDEO_SETTLE_MS / 1000}s for the user to finish.`);
+}
+
+/**
+ * Put an escalated thread on a human's radar WITHOUT pinging anyone.
+ * Separate function so the 24h sweep can reuse it.
+ */
+async function postEscalationRecord(thread, reason, notify, stale = false) {
+    if (!DEV_CHANNEL_ID) return;
+    try {
+        const channel = await client.channels.fetch(DEV_CHANNEL_ID).catch(() => null);
+        if (!channel) return;
+        const link = `https://discord.com/channels/${thread.guildId}/${thread.id}`;
+        await channel.send(noPing({
+            embeds: [noticeEmbed({
+                title: stale ? '⏳ Escalated thread still unanswered' : '🚩 Thread escalated (no ping sent)',
+                description: `**${thread.name}**\n${link}\n\n**Reason:** ${reason}`,
+                color: stale ? COLORS.WARN : COLORS.ESCALATE,
+                footer: stale ? 'Open for 24h with no staff reply' : `notify=${notify}`,
+            })],
+        }));
+    } catch (e) { console.log('⚠️ Could not post escalation record:', e.message); }
 }
 
 /**
@@ -8300,7 +8529,23 @@ function qualityCheckResponse(text, langCode = 'EN-US') {
     // 7. Ensure proper spacing around code blocks
     fixed = fixed.replace(/([^\n])```/g, '$1\n```');
     fixed = fixed.replace(/```([^\n])/g, '```\n$1');
-    
+
+    // 8. Delete directions to a button that no longer exists.
+    //    "🙋 Request Human Help" was removed at the owner's request, but the
+    //    model had seen thousands of examples of itself offering it and kept
+    //    writing "click Request Human Help below" — sending users hunting for a
+    //    control that is not rendered. The prompt forbids it; prompts are not
+    //    guarantees, so strip it deterministically as well.
+    fixed = fixed
+        // "press/click/hit/use the 🙋 Request Human Help button (below)"
+        .replace(/\b(?:please\s+)?(?:press|click|hit|tap|use|select)\s+(?:on\s+)?(?:the\s+)?(?:🙋\s*)?["'*`]*Request\s+Human\s+Help["'*`]*(?:\s+button)?(?:\s+(?:below|above|here))?/gi,
+                 "let me know and I'll pass it to the team")
+        // A bare bulleted/emoji offer of the button on its own line.
+        .replace(/^[ \t]*[-*•]?[ \t]*(?:🙋\s*)?["'*`]*Request\s+Human\s+Help["'*`]*[ \t]*[—–-]?[^\n]*$/gim, '')
+        // Any leftover mention of the button by name.
+        .replace(/(?:🙋\s*)?\bthe\s+["'*`]*Request\s+Human\s+Help["'*`]*\s+button\b/gi, 'a human review')
+        .replace(/\n{3,}/g, '\n\n');
+
     console.log('✅ Response quality checked and cleaned');
     return fixed;
 }
@@ -8336,6 +8581,68 @@ function processAiVisuals(text) {
     return { cleanText: text, attachments };
 }
 
+/**
+ * THE one way an answer leaves Shubba. Do not hand-roll a send beside it.
+ *
+ * The wiki path had all the safeguards — quality check, embeds, mention-free
+ * send. The support path, which handles far more traffic, had none of them: it
+ * called processAiVisuals + splitMessage(1750) and sent raw chunks. So on the
+ * busiest route:
+ *   • stripMentions never ran (it is reached only via qualityCheckResponse), and
+ *     "Attention: @kewz." went out verbatim;
+ *   • noPing() never wrapped the payload;
+ *   • a seven-section Deep Analysis arrived as 3-5 separate messages, because
+ *     1750 chars is well under an embed's 4096.
+ * Two implementations of "send an answer" is how one of them silently rots.
+ * There is now one.
+ *
+ * @param {object} target        thread/channel to send into
+ * @param {string} rawAnswer     model output, unprocessed
+ * @param {object} [opts]
+ * @param {string} [opts.title]        embed title for the first embed
+ * @param {string} [opts.footer]
+ * @param {string} [opts.suffix]       appended to the text (e.g. a version warning)
+ * @param {string} [opts.langCode]     for qualityCheckResponse's link fixes
+ * @param {boolean}[opts.allowButtons] whether the support buttons may be attached
+ * @param {object} [opts.replyTo]      reply to this message instead of plain send
+ */
+async function sendAnswer(target, rawAnswer, opts = {}) {
+    const {
+        title, footer, suffix = '', langCode = 'EN-US',
+        allowButtons = true, replyTo = null,
+    } = opts;
+
+    // 1. Quality check FIRST — this is what strips model-authored @mentions.
+    const fixed = qualityCheckResponse(rawAnswer, langCode);
+    // 2. Pull out image URLs Discord should upload as real attachments.
+    const { cleanText, attachments } = processAiVisuals(fixed);
+    // 3. Honour the model's [NO_BUTTONS] signal.
+    const { text: parsedText, showButtons } = parseButtonSignal(cleanText);
+
+    const body = parsedText + suffix;
+    const embeds = answerEmbeds(body, { title, color: COLORS.ANSWER, footer });
+    const withButtons = allowButtons && showButtons;
+
+    // Discord takes 10 embeds per message; batch so the buttons and the files
+    // land exactly once, on the right message.
+    let sent = null;
+    for (let i = 0; i < embeds.length; i += 10) {
+        const isFirst = i === 0;
+        const isLast = i + 10 >= embeds.length;
+        const payload = { embeds: embeds.slice(i, i + 10) };
+        if (isFirst && attachments.length) payload.files = attachments;
+        if (isLast && withButtons) payload.components = [getSupportButtons()];
+
+        // noPing() is belt to qualityCheckResponse's braces: the text no longer
+        // CONTAINS a mention, and this guarantees it could not fire even if it did.
+        const safe = noPing(payload);
+        sent = (isFirst && replyTo)
+            ? await replyTo.reply(safe)
+            : await target.send(safe);
+    }
+    return sent;
+}
+
 // --- 6. BOT LOGIC ---
 
 const client = new Client({
@@ -8347,6 +8654,14 @@ const client = new Client({
       GatewayIntentBits.GuildModeration,
       GatewayIntentBits.GuildMessageReactions,
   ],
+  // Nothing Shubba sends pings by default.
+  //
+  // noPing() only protects call sites that remember to use it, and an audit
+  // found the support-forum and text-channel answer paths never did — so a
+  // model-authored <@id> or @everyone still notified people for real. A
+  // client-level default makes silence the baseline for EVERY send, including
+  // paths nobody has reviewed. Deliberate pings opt in per-message.
+  allowedMentions: { parse: [] },
 });
 
 // ERROR HANDLER - Prevent crashes from unhandled errors
@@ -8721,18 +9036,32 @@ client.on(Events.ThreadCreate, async (thread) => {
 
     setTimeout(async () => {
       try {
+        // Claim the post BEFORE any await. Checking after fetchStarterMessage()
+        // leaves a ~4.2s window in which MessageCreate can answer the same post
+        // and release the lock, and this handler then answers it a second time.
+        if (answeredStarters.has(thread.id) || processingThreads.has(thread.id)) {
+            console.log(`⏭️ Starter for ${thread.id} already handled, skipping`);
+            return;
+        }
+        answeredStarters.add(thread.id);
+        processingThreads.add(thread.id);
+
+        // A thread that has already been escalated, paused or closed is not ours
+        // to answer. MessageCreate has always checked this; this side never did,
+        // so a timer could post a full answer into a thread the other handler
+        // had just told the user Shubba was stepping away from.
+        if (thread.name.startsWith('(HUMAN HELP)') || pausedThreads.has(thread.id) ||
+            thread.name.startsWith('[SOLVED]') || thread.name.startsWith('[CLOSED]')) {
+            processingThreads.delete(thread.id);
+            return;
+        }
+
         const starter = await thread.fetchStarterMessage();
         if (!starter) {
             console.error(`⚠️ Could not fetch starter message for thread: ${thread.name}`);
+            processingThreads.delete(thread.id);
             return;
         }
-        
-        if (processingThreads.has(thread.id)) {
-            console.log(`⏭️ Thread ${thread.id} already being processed, skipping`);
-            return;
-        }
-        
-        processingThreads.add(thread.id);
         console.log(`🔄 Processing support thread: ${thread.name}`);
         await thread.sendTyping();
         
@@ -8742,8 +9071,15 @@ client.on(Events.ThreadCreate, async (thread) => {
         threadMemory[thread.id].opId = starter.author.id;
         threadMemory[thread.id].opUsername = starter.author.username;
         
-        await applyTagsFromText(starter, thread); 
+        await applyTagsFromText(starter, thread);
         const { details, logContent, hasVideo, hasImage } = await analyzeAttachments(starter, thread.id);
+
+        // Schema-check any attached compat/animation/model JSON or .zip pack
+        // BEFORE the model reasons about it. This ran only in the wiki forum, so
+        // a resource pack dropped in the SUPPORT forum — where people actually
+        // report "my item sits wrong" — was never opened. A validator cannot
+        // invent a rule; the model can, and did.
+        await validatePunchyFiles(starter).catch(e => console.log('[validate]', e.message));
 
         // Read tags AFTER applyTagsFromText so auto-applied tags are included
         const tags = thread.appliedTags.map(tagId => thread.parent.availableTags.find(t => t.id === tagId)?.name || "Unknown Tag");
@@ -8786,10 +9122,20 @@ client.on(Events.ThreadCreate, async (thread) => {
         const conversationContext = buildConversationContext(thread.id);
         
         // ── TAG GATE ─────────────────────────────────────────────────────────
-        // Refuse to help until the user provides both a version and a loader tag.
+        // Hold off until we know the game version and loader — but count EVERY
+        // source we already have, not just the tags. detectedVersion and
+        // logContent are computed above and were previously thrown away here,
+        // which is how Shubba came to demand a version that was on line one of
+        // the crash report it was reading.
         // IMPORTANT: Do NOT return here — fall through to the finally block so
         // processingThreads gets cleaned up. Just skip the rest of the logic.
-        const tagGateMsg = getTagGateMessage(tags);
+        const gateEvidence = {
+            logContent,
+            detectedVersion,
+            userInfo: threadMemory[thread.id]?.userInfo || {},
+            text: starter.content,
+        };
+        const tagGateMsg = getTagGateMessage(tags, gateEvidence);
         if (!tagGateMsg) {
         // ── (all the main processing happens inside this block) ───────────────
 
@@ -8834,9 +9180,9 @@ client.on(Events.ThreadCreate, async (thread) => {
             thread, 
             tags, 
             details, 
-            logContent, 
-            checkTagCompliance(tags), 
-            conversationContext, 
+            logContent,
+            checkTagCompliance(tags, gateEvidence),
+            conversationContext,
             freshKnowledge,
             isDeepAnalysis,
             detectedVersion,
@@ -8850,41 +9196,28 @@ client.on(Events.ThreadCreate, async (thread) => {
         
         addToThreadMemory(thread.id, client.user.username, rawAnswer, true);
         
-        const { cleanText, attachments } = processAiVisuals(rawAnswer);
-        const { text: parsedText, showButtons } = parseButtonSignal(cleanText);
-        const chunks = splitMessage(parsedText);
-        
-        const firstChunk = isDeepAnalysis 
-            ? `📊 **Deep Technical Analysis Report**\n\n${chunks[0]}${versionWarning}`
-            : `${chunks[0]}${versionWarning}`;
-        
-        await thread.send({ content: firstChunk, files: attachments });
-        
-        for (let i = 1; i < chunks.length - 1; i++) {
-            await thread.send(chunks[i]);
-        }
-        
-        if (chunks.length > 1) {
-            const lastContent = chunks[chunks.length - 1];
-            if (showButtons) {
-                await thread.send({ content: lastContent, components: [getSupportButtons()] });
-            } else {
-                await thread.send(lastContent);
-            }
-        } else if (showButtons) {
-            const messages = await thread.messages.fetch({ limit: 1 });
-            const lastMsg = messages.first();
-            if (lastMsg && lastMsg.author.id === client.user.id) {
-                await lastMsg.edit({ components: [getSupportButtons()] }).catch(() => {});
-            }
-        }
+        await sendAnswer(thread, rawAnswer, {
+            title: isDeepAnalysis ? '📊 Deep Technical Analysis Report' : undefined,
+            footer: 'Punchy! Support · react 👎 if this missed the mark',
+            suffix: versionWarning,
+        });
         } else {
             // ── TAGS MISSING: send the gate message, finally block still runs ──
             // Counts as the first of TAG_GATE_MAX_NAGS so the follow-up path
             // does not start the count over and ask twice more.
-            tagGateNagCount.set(thread.id, (tagGateNagCount.get(thread.id) || 0) + 1);
-            console.log(`🏷️ Thread "${thread.name}" missing required tags. Sending tag request.`);
-            await thread.send(tagGateMsg);
+            //
+            // This side used to increment with NO budget check — only the
+            // follow-up path checked. So the budget was spendable here without
+            // limit, and the user's next message skipped straight to the
+            // prose-worded ask. Respect the same ceiling both sides.
+            const shownAlready = tagGateNagCount.get(thread.id) || 0;
+            if (shownAlready < TAG_GATE_MAX_NAGS) {
+                tagGateNagCount.set(thread.id, shownAlready + 1);
+                console.log(`🏷️ Thread "${thread.name}" missing required tags. Sending tag request.`);
+                await thread.send(tagGateMsg);
+            } else {
+                console.log(`🏷️ "${thread.name}" already nagged ${shownAlready}× — staying quiet.`);
+            }
         }
         // ── END TAG GATE ──────────────────────────────────────────────────────
         
@@ -8911,18 +9244,26 @@ client.on(Events.ThreadCreate, async (thread) => {
     
     setTimeout(async () => {
       try {
+        // Claim before awaiting — see the note on answeredStarters.
+        if (answeredStarters.has(thread.id) || processingThreads.has(thread.id)) {
+            console.log(`⏭️ Wiki starter for ${thread.id} already handled, skipping`);
+            return;
+        }
+        answeredStarters.add(thread.id);
+        processingThreads.add(thread.id);
+
+        if (thread.name.startsWith('(HUMAN HELP)') || pausedThreads.has(thread.id) ||
+            thread.name.startsWith('[SOLVED]') || thread.name.startsWith('[CLOSED]')) {
+            processingThreads.delete(thread.id);
+            return;
+        }
+
         const starter = await thread.fetchStarterMessage();
         if (!starter) {
             console.error(`⚠️ Could not fetch starter message for wiki thread: ${thread.name}`);
+            processingThreads.delete(thread.id);
             return;
         }
-        
-        if (processingThreads.has(thread.id)) {
-            console.log(`⏭️ Wiki thread ${thread.id} already being processed, skipping`);
-            return;
-        }
-        
-        processingThreads.add(thread.id);
         console.log(`🔄 Processing wiki thread: ${thread.name}`);
         await thread.sendTyping();
         
@@ -9245,6 +9586,7 @@ ${freshKnowledge.substring(0, 160000)}
 VERIFIED PUNCHY KNOWLEDGE (authoritative — official addon/mod roster, config, keybinds, known issues):
 ${PUNCHY_STATIC_KNOWLEDGE}
 ${buildCustomKnowledge()}
+${ownerKnowledge(true)}
 
 Instructions:
 - Be helpful, direct, and technical — this is a dev channel
@@ -9336,7 +9678,18 @@ Instructions:
     const isDev = isOwner;
     const isPrimaryOwner = message.author.id === OWNER_ID;
     const contentLower = message.content.toLowerCase();
-    const isMentioned = message.mentions.has(client.user) && !message.mentions.everyone;
+    // Message#mentions.has() defaults to counting a role Shubba holds AND the
+    // implicit mention Discord attaches when someone merely REPLIES to one of
+    // Shubba's own messages. That made "replying to Shubba" indistinguishable
+    // from "@-ing Shubba", so a user who replied to the "Shubba has stepped
+    // aside and won't reply again unless tagged" embed restarted the whole
+    // pipeline — and reply-gate rule 1 short-circuits every other rule on it.
+    // The text-channel gate below already uses the strict form; this one did not.
+    const isMentioned = message.mentions.has(client.user, {
+        ignoreRoles: true,
+        ignoreEveryone: true,
+        ignoreRepliedUser: true,
+    });
 
     // ============================================================
     // DEV NATURAL LANGUAGE COMMANDS
@@ -9605,6 +9958,7 @@ ${devModeInstructions}
 VERIFIED PUNCHY KNOWLEDGE (authoritative — use this for any facts about the mod, its OFFICIAL addons/roster, config, and keybinds; the roster of official Punchy Guys Studios projects is listed here):
 ${PUNCHY_STATIC_KNOWLEDGE}
 ${buildCustomKnowledge()}
+${ownerKnowledge(isDevChannel)}
 
 Instructions:
 - Be casual, direct, and helpful — you're talking to a dev, not a user
@@ -9908,16 +10262,13 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
                 return;
             }
 
-            // Strip the forum-only button signal — those buttons act on forum
-            // threads and are meaningless here.
-            const { cleanText, attachments } = processAiVisuals(rawAnswer);
-            const { text: parsedText } = parseButtonSignal(cleanText);
-            const chunks = splitMessage(parsedText);
-
-            await message.reply({ content: chunks[0], files: attachments });
-            for (let i = 1; i < chunks.length; i++) {
-                await message.channel.send(chunks[i]);
-            }
+            // allowButtons:false — the support buttons act on forum threads and
+            // are meaningless in a text channel.
+            await sendAnswer(message.channel, rawAnswer, {
+                langCode: detectedLang,
+                allowButtons: false,
+                replyTo: message,
+            });
         } catch (e) {
             console.error('❌ Error answering text-channel mention:', e);
             await message.reply('⚠️ I ran into an issue answering that. Please try again in a moment.').catch(() => {});
@@ -9926,6 +10277,15 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
     }
 
     if (message.channel.parentId !== SUPPORT_FORUM_ID && message.channel.parentId !== WIKI_FORUM_ID) return;
+
+    // A forum post's starter message has id === thread id, and it belongs to the
+    // ThreadCreate handler. Handling it here as well is what produced two
+    // separate answers to one post. Follow-ups have a different id and still
+    // flow through normally.
+    // (Do NOT mark it answered here — ThreadCreate has not run yet, and claiming
+    // it would silence the handler that is actually supposed to answer.)
+    if (message.id === message.channel.id) return;
+
     const thread = message.channel;
     const isWikiForum = thread.parentId === WIKI_FORUM_ID;
     
@@ -10064,6 +10424,18 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
                 ? `a file: ${message.attachments.first().name}` 
                 : `${message.attachments.size} files: ${[...message.attachments.values()].map(a => a.name).join(', ')}`} — see FILE DATA section]`
             : '');
+    // Prevent double-processing. Claimed BEFORE the video branch below: that
+    // branch used to `return` from above this line, escalating and exiting
+    // without ever holding the lock, so a concurrent handler found the thread
+    // free and answered into a thread the user had just been told Shubba was
+    // stepping away from.
+    if (processingThreads.has(thread.id)) {
+        console.log(`⏭️ Thread ${thread.id} already being processed, skipping follow-up`);
+        return;
+    }
+
+    processingThreads.add(thread.id);
+
     if (hasVideo && !isWikiForum) {
         const currentTags = thread.appliedTags.map(id => thread.parent.availableTags.find(t => t.id === id)?.name || '');
         const hasVersionTag = TAG_CATEGORIES.VERSIONS.some(v => currentTags.includes(v));
@@ -10073,18 +10445,18 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
         const hasContext = mem.conversationHistory.length >= 2 ||
             (mem.conversationHistory.length >= 1 && mem.conversationHistory[0].content.trim().length >= 30);
         if (hasVersionTag && hasLoaderTag && hasContext) {
-            return await requestHumanHelp(thread, "Video posted with full reproduction context.", 'silent');
+            processingThreads.delete(thread.id);
+            // Do NOT escalate on this tick. A user answering "can you record it?"
+            // uploads the video first and the explanation second — escalating the
+            // instant the video lands renamed the thread to (HUMAN HELP) 21
+            // seconds into an upload and then went mute, so the rest of the
+            // evidence went into a thread nothing was watching. Wait for them to
+            // finish; any further message reschedules.
+            scheduleVideoEscalation(thread);
+            return;
         }
         // Fall through — Shubba will respond and collect the missing info
     }
-
-    // Prevent double-processing
-    if (processingThreads.has(thread.id)) {
-        console.log(`⏭️ Thread ${thread.id} already being processed, skipping follow-up`);
-        return;
-    }
-
-    processingThreads.add(thread.id);
 
     try {
         await thread.sendTyping();
@@ -10172,24 +10544,22 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             
             addToThreadMemory(thread.id, client.user.username, fixedAnswer, true);
             
-            const chunks = splitMessage(fixedAnswer);
-            await thread.send(chunks[0]);
-            for (let i = 1; i < chunks.length - 1; i++) {
-                await thread.send(chunks[i]);
-            }
-            
-            if (chunks.length > 1) {
-                await thread.send({ content: chunks[chunks.length - 1], components: [getSupportButtons()] });
-            } else {
-                const messages = await thread.messages.fetch({ limit: 1 });
-                const lastMsg = messages.first();
-                if (lastMsg && lastMsg.author.id === client.user.id) {
-                    await lastMsg.edit({ components: [getSupportButtons()] }).catch(() => {});
-                }
-            }
-            
+            // Same embed treatment as the wiki STARTER path — this follow-up
+            // path was still sending raw 1750-char chunks, so one conversation
+            // switched formats halfway through.
+            const wikiFlag = detectedLang === 'EN-US' ? '📚' : `🌐 ${langInfo.nativeName}`;
+            await sendAnswer(thread, fixedAnswer, {
+                title: `${wikiFlag} Wiki Help`,
+                footer: 'Punchy! Wiki · react 👎 if this missed the mark',
+                langCode: detectedLang,
+            });
+
         } else {
             // ── SUPPORT FORUM FOLLOW-UP ───────────────────────────────────────
+
+            // Same as the starter path: open and schema-check any pack or JSON
+            // the user just uploaded, in THIS forum too.
+            await validatePunchyFiles(message).catch(e => console.log('[validate]', e.message));
 
             // Tags may have just been updated by applyTagsFromText above — re-fetch
             const freshThread = await client.channels.fetch(thread.id).catch(() => thread);
@@ -10198,7 +10568,16 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             );
 
             // ── TAG GATE (follow-up) ──────────────────────────────────────────
-            const tagGateMsgFollowUp = getTagGateMessage(tags);
+            // Same evidence rule as the starter gate: a fact we already hold is
+            // not missing, whichever source it came from.
+            const gateEvidence = {
+                logContent,
+                detectedVersion: logContent ? extractPunchyVersion(logContent) : null,
+                userInfo: threadMemory[thread.id]?.userInfo || {},
+                text: effectiveContent,
+            };
+            let gateExhausted = false;
+            const tagGateMsgFollowUp = getTagGateMessage(tags, gateEvidence);
             if (tagGateMsgFollowUp) {
                 const shown = tagGateNagCount.get(thread.id) || 0;
                 if (shown < TAG_GATE_MAX_NAGS) {
@@ -10208,6 +10587,11 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
                     return;
                 }
                 // Already asked twice. Stop gating and answer — see tagGateNagCount.
+                // Also stop feeding the demand to the MODEL: the prompt's
+                // "MISSING INFO: ask for this" line is built from the same
+                // computation, so giving up on the canned gate while still
+                // passing `missing` just moved the third ask into prose.
+                gateExhausted = true;
                 console.log(`🏷️ "${thread.name}" still untagged after ${shown} reminders — answering anyway.`);
             }
             // ── END TAG GATE ──────────────────────────────────────────────────
@@ -10247,9 +10631,9 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
                 thread, 
                 tags, 
                 details, 
-                logContent, 
-                checkTagCompliance(tags), 
-                conversationContext, 
+                logContent,
+                gateExhausted ? [] : checkTagCompliance(tags, gateEvidence),
+                conversationContext,
                 freshKnowledge,
                 isDeepAnalysis,
                 detectedVersion,
@@ -10263,34 +10647,11 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
             
             addToThreadMemory(thread.id, client.user.username, rawAnswer, true);
             
-            const { cleanText, attachments } = processAiVisuals(rawAnswer);
-            const { text: parsedText, showButtons } = parseButtonSignal(cleanText);
-            const chunks = splitMessage(parsedText);
-            
-            const firstChunk = isDeepAnalysis 
-                ? `📊 **Deep Technical Analysis Report**\n\n${chunks[0]}${versionWarning}`
-                : `${chunks[0]}${versionWarning}`;
-            
-            await thread.send({ content: firstChunk, files: attachments });
-            
-            for (let i = 1; i < chunks.length - 1; i++) {
-                await thread.send(chunks[i]);
-            }
-            
-            if (chunks.length > 1) {
-                const lastContent = chunks[chunks.length - 1];
-                if (showButtons) {
-                    await thread.send({ content: lastContent, components: [getSupportButtons()] });
-                } else {
-                    await thread.send(lastContent);
-                }
-            } else if (showButtons) {
-                const messages = await thread.messages.fetch({ limit: 1 });
-                const lastMsg = messages.first();
-                if (lastMsg && lastMsg.author.id === client.user.id) {
-                    await lastMsg.edit({ components: [getSupportButtons()] }).catch(() => {});
-                }
-            }
+            await sendAnswer(thread, rawAnswer, {
+                title: isDeepAnalysis ? '📊 Deep Technical Analysis Report' : undefined,
+                footer: 'Punchy! Support · react 👎 if this missed the mark',
+                suffix: versionWarning,
+            });
         }
         
     } catch (error) { 
@@ -11655,7 +12016,12 @@ async function askGemini(latest, thread, tags, files, data, missing, conversatio
   // These are ALWAYS injected directly — never truncated by the wiki/discord content
   // PUNCHY_STATIC_KNOWLEDGE and custom entries were previously appended to the end of
   // the knowledge buffer and silently cut off by substring(0, 30000). Now guaranteed present.
-  const guaranteedKnowledge = `${PUNCHY_STATIC_KNOWLEDGE}\n${buildCustomKnowledge()}`;
+  // ownerKnowledge() is empty for everyone but an owner. The internals used to
+  // be baked into PUNCHY_STATIC_KNOWLEDGE and shipped with every public prompt,
+  // guarded only by a sentence asking the model not to repeat them — one
+  // successful "ignore your instructions" away from leaking class names for a
+  // closed-source mod. Now the bytes simply are not there.
+  const guaranteedKnowledge = `${PUNCHY_STATIC_KNOWLEDGE}\n${buildCustomKnowledge()}${ownerKnowledge(isOwnerQuery)}`;
 
   // Determine if we should use thinking mode
   const modelDecision = shouldUseThinking(latest, data.length > 100, isDeep);
@@ -12052,23 +12418,78 @@ async function getSummary(fullChat, title) {
     }
 }
 
-function checkTagCompliance(tags) {
+/**
+ * Do we know the user's game version and loader — from ANY source?
+ *
+ * The gate used to read forum tags and nothing else. Meanwhile the very same
+ * request had already extracted the version from the crash report, from the
+ * .jar filename, and from the user's own prose, and had put "Game Version:
+ * 1.21.1" into the prompt. So Shubba would open a reply demanding the Minecraft
+ * version while the version sat on line one of the report it was answering.
+ * That is the single most common complaint about it.
+ *
+ * Tags remain the preferred source — they make the forum searchable — but they
+ * are no longer the ONLY source, because a fact we already have is not missing.
+ *
+ * @param {string[]} tags               applied forum tag names
+ * @param {object}   [evidence]
+ * @param {string}   [evidence.logContent]      full text of any attached log
+ * @param {string}   [evidence.detectedVersion] version parsed from log/filename
+ * @param {object}   [evidence.userInfo]        remembered {version, loader}
+ * @param {string}   [evidence.text]            the user's own message text
+ */
+function haveSetupFacts(tags = [], evidence = {}) {
+    // Defaults in a destructure only cover `undefined`, and these values come
+    // from thread memory, which can hold an explicit null. Coerce instead.
+    const ev = evidence || {};
+    const userInfo = ev.userInfo || {};
+    const detectedVersion = ev.detectedVersion || null;
+    const log = String(ev.logContent || '');
+    const prose = String(ev.text || '');
+    const tagList = Array.isArray(tags) ? tags : [];
+
+    const haveVersion =
+        tagList.some(t => TAG_CATEGORIES.VERSIONS.includes(t)) ||
+        !!detectedVersion ||
+        !!userInfo.version ||
+        /Minecraft Version:\s*[\d.]+/i.test(log) ||
+        /(?:Loading|Launching)\s+Minecraft\s+[\d.]+/i.test(log) ||
+        // A version the user typed. Matched by SHAPE, not by requiring the word
+        // "Minecraft" in front of it — people write "I'm on 1.21.1", never
+        // "I'm on Minecraft version 1.21.1". Both numbering schemes: the old
+        // 1.x.y and the current 26.x.
+        TAG_CATEGORIES.VERSIONS.some(v => prose.includes(v)) ||
+        /\b1\.\d{2}(?:\.\d{1,2})?\b/.test(prose) ||
+        /\b2[6-9]\.\d(?:\.\d{1,2})?\b/.test(prose);
+
+    const haveLoader =
+        tagList.some(t => TAG_CATEGORIES.LOADERS.includes(t)) ||
+        !!userInfo.loader ||
+        /\b(fabric[ -]?loader|neoforge|forge)\b/i.test(log) ||
+        /\b(fabric|neoforge|forge)\b/i.test(prose);
+
+    return { haveVersion, haveLoader };
+}
+
+function checkTagCompliance(tags, evidence = {}) {
+    const { haveVersion, haveLoader } = haveSetupFacts(tags, evidence);
     const missing = [];
-    if (!tags.some(t => TAG_CATEGORIES.VERSIONS.includes(t))) missing.push("Game Version");
-    if (!tags.some(t => TAG_CATEGORIES.LOADERS.includes(t))) missing.push("Mod Loader");
+    if (!haveVersion) missing.push("Game Version");
+    if (!haveLoader) missing.push("Mod Loader");
     return missing;
 }
 
 /**
- * Check whether the thread has the required tags (version + loader) to proceed.
- * Returns { ok: true } if tags are present, or { ok: false, message: string } if not.
+ * Check whether we know enough about the setup to proceed.
+ * Returns null when we do, or the polite request text when we genuinely don't.
  *
- * When tags are missing, Shubba should ONLY send the polite request for info —
- * NO support buttons, NO solve button, just a plain message asking for the tags.
+ * When it returns text, Shubba should send ONLY that — no support buttons, no
+ * solve button, just the plain request.
  */
-function getTagGateMessage(tags) {
-    const missingVersion = !tags.some(t => TAG_CATEGORIES.VERSIONS.includes(t));
-    const missingLoader = !tags.some(t => TAG_CATEGORIES.LOADERS.includes(t));
+function getTagGateMessage(tags, evidence = {}) {
+    const { haveVersion, haveLoader } = haveSetupFacts(tags, evidence);
+    const missingVersion = !haveVersion;
+    const missingLoader = !haveLoader;
 
     if (!missingVersion && !missingLoader) return null; // All good
 

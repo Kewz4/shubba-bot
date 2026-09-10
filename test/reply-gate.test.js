@@ -116,3 +116,67 @@ test('missing opId does not silence the bot', () => {
     const r = shouldReplyInThread({ authorId: HELPER, content: 'how do I fix the bow animation?' });
     assert.equal(r.reply, true, r.reason);
 });
+
+// Regression: rule 3 used to reject EVERY non-author unconditionally, so a
+// second person hitting the same bug could upload their latest.log in reply to
+// "can you send your log?" and be met with silence.
+test('a non-author who uploads a file after Shubba asked gets an answer', () => {
+    const r = shouldReplyInThread({
+        authorId: HELPER,
+        opId: OP,
+        recentHumanAuthorIds: [OP],
+        lastResponderWasShubba: true,
+        content: '',
+        hasAttachments: true,
+    });
+    assert.equal(r.reply, true, r.reason);
+});
+
+test('a non-author uploading with nobody else active is still answered', () => {
+    const r = shouldReplyInThread({
+        authorId: HELPER,
+        opId: OP,
+        recentHumanAuthorIds: [],
+        lastResponderWasShubba: false,
+        content: 'same problem here, log attached',
+        hasAttachments: true,
+    });
+    assert.equal(r.reply, true, r.reason);
+});
+
+// The exception must stay narrow — it is not a licence to barge back in.
+test('a helper attaching a file mid-conversation is still left alone', () => {
+    const r = shouldReplyInThread({
+        authorId: HELPER,
+        opId: OP,
+        recentHumanAuthorIds: [OP, 'third-user'],
+        lastResponderWasShubba: false,
+        content: 'here, try this config',
+        hasAttachments: true,
+    });
+    assert.equal(r.reply, false, r.reason);
+});
+
+test('a non-author with no file is still left alone', () => {
+    const r = shouldReplyInThread({
+        authorId: HELPER,
+        opId: OP,
+        recentHumanAuthorIds: [OP],
+        lastResponderWasShubba: true,
+        content: 'try reinstalling the pack',
+        hasAttachments: false,
+    });
+    assert.equal(r.reply, false, r.reason);
+});
+
+test('a file from someone else aimed at another member is still ignored', () => {
+    const r = shouldReplyInThread({
+        authorId: HELPER,
+        opId: OP,
+        isReplyToOtherUser: true,
+        lastResponderWasShubba: true,
+        hasAttachments: true,
+        content: 'this is the one you wanted',
+    });
+    assert.equal(r.reply, false, r.reason);
+});
