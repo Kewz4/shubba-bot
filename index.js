@@ -95,6 +95,7 @@ const { inspectResourcePack } = require('./lib/zip-reader');
 // matter (version, loader, failing mixin) are scattered across the whole file
 // rather than the part that fits. This reads them properly.
 const { analyzeLog, isLikelyLog } = require('./lib/log-analyzer');
+const { isExplicitHumanRequest, humanRequestAcknowledgement } = require('./lib/human-request');
 // Version-aware solution memory: detect, distil, dedupe, rank.
 const {
     distil: distilSolution,
@@ -10443,7 +10444,22 @@ Respond naturally as a helpful colleague.`, needsThinking.useThinking);
     
     addToThreadMemory(thread.id, message.author.username, message.content, false);
     extractUserInfo(thread.id, message.content);
-    
+
+    // Someone plainly asking for a person gets one. Removing the "Request Human
+    // Help" button closed the ping — it also closed the only route to a human,
+    // and the transcripts show a user asking for a developer and getting another
+    // round of bot triage instead.
+    //
+    // 'silent': the flag renames the thread and posts a no-ping record to the
+    // dev channel. A user still cannot make Shubba ping anybody by typing,
+    // which is exactly the behaviour the owner asked to stop.
+    if (isExplicitHumanRequest(message.content)) {
+        console.log(`🙋 Explicit human request in "${thread.name}" — flagging silently.`);
+        await thread.send(noPing(humanRequestAcknowledgement())).catch(() => {});
+        await requestHumanHelp(thread, 'The user asked for a human directly.', 'silent');
+        return;
+    }
+
     const { details, logContent, hasVideo } = await analyzeAttachments(message, thread.id);
 
     // If user sent only an attachment with no text, give Gemini a clear signal
@@ -12263,8 +12279,10 @@ The two buttons are:
   @punchymod" into a reply and notified both owners for a mod-compat issue that
   needed no immediate attention — the user then apologised for pinging them.
   You do not summon people. Say "I've flagged this for the team" and stop.
-  If a user types "request human help" as a message, that is NOT a command:
-  answer them normally, flag the thread if it warrants it, and do not ping.
+  If a user plainly asks for a person ("can I talk to a human", "can a dev look
+  at this"), you will not see that message at all — it is detected in code
+  before it reaches you, the thread is flagged silently, and the user is told
+  so. You never need to handle it, and you must never offer to ping anyone.
 
 Showing these buttons is a real action that affects a real person. Don't show them by default. Don't show them as decoration. Run this decision tree:
 

@@ -99,6 +99,9 @@ test('answer sends are mention-free, and only escalation opts in', () => {
 test('the prompt forbids the model from writing mentions', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
     assert.match(src, /NEVER WRITE AN @MENTION/, 'the rule must be stated to the model too');
-    assert.match(src, /is NOT a command/i,
-        'typing "request human help" must not be treated as a trigger');
+    // A user asking for a person is now handled in code and never reaches the
+    // model, so the rule is a guarantee rather than an instruction it might
+    // ignore. What must hold either way: typing it can never produce a ping.
+    assert.match(src, /never offer to ping anyone/i,
+        'the model must not be able to turn a typed request into a summons');
 });
