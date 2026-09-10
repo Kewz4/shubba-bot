@@ -2534,11 +2534,42 @@ async function buildAddonPinnedContent(guild) {
     ].join('\n');
 }
 
+/**
+ * The pinned addon post, as a payload Discord will actually accept.
+ *
+ * It was sent as one plain-text message. A plain message caps at 2000
+ * characters; the guidelines alone are ~2,300, and the roster grows by a line
+ * per addon (35 and counting). So every boot logged
+ *   "Invalid Form Body — content[BASE_TYPE_MAX_LENGTH]: Must be 2000 or fewer"
+ * and the post silently stopped updating — new addon roles never appeared on it.
+ *
+ * Embeds hold 4096 each, so the same text fits with room to grow, and
+ * answerEmbeds() handles the split if it ever outgrows one.
+ */
+async function buildAddonPinnedPayload(guild) {
+    const text = await buildAddonPinnedContent(guild);
+
+    // Lift the leading "# " heading out into the embed title so it is not
+    // repeated in the body.
+    const lines = text.split('\n');
+    const title = lines[0].startsWith('# ') ? lines[0].slice(2).trim() : '🧩 Punchy! Addon Showcase';
+    const body = (lines[0].startsWith('# ') ? lines.slice(1) : lines).join('\n').trim();
+
+    return {
+        content: '',
+        embeds: answerEmbeds(body, {
+            title,
+            color: COLORS.ANSWER,
+            footer: 'Punchy! Addon Showcase · updated automatically',
+        }),
+    };
+}
+
 async function updateAddonPinnedPost(guild) {
     try {
         const forum = await client.channels.fetch(ADDON_FORUM_ID).catch(() => null);
         if (!forum) return;
-        const content = await buildAddonPinnedContent(guild);
+        const payload = await buildAddonPinnedPayload(guild);
 
         // Always prefer the hardcoded canonical post ID. This prevents Shubba from
         // ever creating a duplicate when the original post falls out of the
@@ -2556,7 +2587,7 @@ async function updateAddonPinnedPost(guild) {
                     }
                     const starter = await pinnedThread.fetchStarterMessage().catch(() => null);
                     if (starter) {
-                        await starter.edit(content);
+                        await starter.edit(payload);
                         // Persist the canonical ID so storage stays consistent
                         if (addonPinnedMessageId !== targetThreadId) {
                             addonPinnedMessageId = targetThreadId;
@@ -2602,7 +2633,7 @@ async function updateAddonPinnedPost(guild) {
 
         const thread = await freshForum.threads.create({
             name: '📌 About This Forum — Read First',
-            message: { content },
+            message: payload,
             appliedTags: appliedTags.length ? appliedTags : undefined,
             reason: 'Shubba auto-created addon forum instructions',
         });
