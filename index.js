@@ -263,6 +263,21 @@ function requireAuth(req) {
 }
 
 function sendAuth(res) {
+    // An unconfigured panel is NOT the same as a bad password, and must not look
+    // like one. requireAuth() fails closed, so with the env vars unset every
+    // request 401s — and a 401 carrying WWW-Authenticate makes the browser
+    // re-prompt, forever. That is precisely the "infinite login" reported here:
+    // the dashboard had simply never had DASHBOARD_USER / DASHBOARD_PASS set,
+    // and there was no way to tell that apart from typing the password wrong.
+    // Say which it is.
+    if (!DASHBOARD_ENABLED) {
+        res.writeHead(503, { 'Content-Type': 'text/plain' });
+        res.end('Dashboard is not configured.\n\n'
+            + 'DASHBOARD_USER and DASHBOARD_PASS are unset, so every login is refused\n'
+            + 'by design rather than shipping a default password on a public IP.\n'
+            + 'Set both in the server\'s .env and restart the bot.\n');
+        return;
+    }
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Shubba Admin"', 'Content-Type': 'text/plain' });
     res.end('Unauthorized');
 }
