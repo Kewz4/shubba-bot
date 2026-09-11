@@ -104,3 +104,39 @@ test('getHomeGuild no longer falls back to whichever guild is cached first', () 
     assert.doesNotMatch(fn, /cache\.first\(\)/,
         'with two guilds, .first() is chance — role audits and dashboard bans could bind to staging');
 });
+
+// ─── Channel lookup by NAME must stay inside the live guild ─────────────────
+// Found by an independent isolation audit: the auto-message features resolved
+// their target with a global fetch plus a global name match. Staging mirrors
+// live's channel names exactly, so a live welcome could land in staging.
+
+test('no code path matches a channel by name across every guild', () => {
+    const code = SRC.split('\n').filter(l => !/^\s*(\*|\/\/)/.test(l)).join('\n');
+    assert.doesNotMatch(code, /client\.channels\.cache\.find\(\s*c\s*=>\s*c\.name/,
+        'a global name lookup is back — scope it to getHomeGuild() or use resolveHomeChannel()');
+});
+
+test('resolveHomeChannel only ever returns a channel from the live guild', async () => {
+    const fn = SRC.slice(SRC.indexOf('async function resolveHomeChannel('), SRC.indexOf('\n}', SRC.indexOf('async function resolveHomeChannel(')) + 2);
+    const liveGuild = {
+        id: LIVE,
+        channels: {
+            cache: new Map([['1600000000000000001', { id: '1600000000000000001', guildId: LIVE, name: '👋│welcome' }]]),
+            fetch: async (id) => (id === '1700000000000000009' ? { id, guildId: STAGING, name: '👋│welcome' } : null),
+        },
+    };
+    liveGuild.channels.cache.find = (pred) => [...liveGuild.channels.cache.values()].find(pred);
+    const sandbox = { getHomeGuild: () => liveGuild };
+    vm.createContext(sandbox);
+    vm.runInContext(fn, sandbox);
+    const r = sandbox.resolveHomeChannel;
+    assert.equal((await r('1600000000000000001'))?.guildId, LIVE, 'a live id resolves');
+    assert.equal((await r('👋│welcome'))?.guildId, LIVE, 'a name resolves within live');
+    const stray = await r('1700000000000000009');
+    assert.ok(!stray || stray.guildId === LIVE, 'a channel reporting another guild must never be returned');
+    assert.equal(await r(null), null);
+});
+
+test('every auto-message sender goes through resolveHomeChannel', () => {
+    assert.ok((SRC.match(/await resolveHomeChannel\(/g) || []).length >= 6);
+});

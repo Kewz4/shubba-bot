@@ -67,6 +67,29 @@ function isForeignGuild(guildId) {
     if (!guildId) return false;
     return !allowedGuildIds().has(String(guildId));
 }
+
+/**
+ * Resolve an auto-message target (a channel id, or a channel name) to a
+ * channel IN THE LIVE GUILD — never anywhere else.
+ *
+ * The auto-message features used `client.channels.fetch(ref) ||
+ * client.channels.cache.find(c => c.name === ref)`. Both are GLOBAL: they
+ * search every guild this process is in. Once staging mirrored live's channel
+ * names exactly, a live welcome stored by name — or by a stale id — could be
+ * delivered into staging's same-named channel, and live would silently lose
+ * it. Found by an independent isolation audit.
+ */
+async function resolveHomeChannel(ref) {
+    const guild = getHomeGuild();
+    if (!guild || !ref) return null;
+    const key = String(ref);
+    if (/^\d{17,20}$/.test(key)) {
+        const byId = guild.channels.cache.get(key)
+            || await guild.channels.fetch(key).catch(() => null);
+        if (byId && byId.guildId === guild.id) return byId;
+    }
+    return guild.channels.cache.find(c => c.name === key) || null;
+}
 process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); shubbaLogError('unhandledRejection', e); });
 process.on('uncaughtException',  (e) => { console.error('uncaughtException:', e);  shubbaLogError('uncaughtException', e); });
 
@@ -920,8 +943,7 @@ const dashboardServer = http.createServer(async (req, res) => {
                 // Recurring interval
                 const iv = setInterval(async () => {
                     try {
-                        const ch = await client.channels.fetch(channel).catch(() => null)
-                            || client.channels.cache.find(c => c.name === channel);
+                        const ch = await resolveHomeChannel(channel);
                         if (ch?.isTextBased()) await ch.send(content);
                     } catch(e) { console.log('Auto message error:', e.message); }
                 }, entry.interval);
@@ -932,8 +954,7 @@ const dashboardServer = http.createServer(async (req, res) => {
                 console.log(`📅 Scheduled one-time message for ${sendAt} (${Math.round(delay/60000)}min from now) → channel ${channel}`);
                 const to = setTimeout(async () => {
                     try {
-                        const ch = await client.channels.fetch(channel).catch(() => null)
-                            || client.channels.cache.find(c => c.name === channel);
+                        const ch = await resolveHomeChannel(channel);
                         if (ch?.isTextBased()) {
                             await ch.send(content);
                             console.log(`✅ Sent scheduled message to channel ${channel}`);
@@ -3003,8 +3024,7 @@ async function loadDashboardStores() {
                     if (m.trigger === 'scheduled') {
                         const iv = setInterval(async () => {
                             try {
-                                const ch = await client.channels.fetch(m.channel).catch(() => null)
-                                    || client.channels.cache.find(c => c.name === m.channel);
+                                const ch = await resolveHomeChannel(m.channel);
                                 if (ch?.isTextBased()) await ch.send(m.content);
                             } catch(e) { console.log('Auto message error:', e.message); }
                         }, m.interval || 3600000);
@@ -3016,8 +3036,7 @@ async function loadDashboardStores() {
                             console.log(`📅 Restored scheduled_once message for ${m.sendAt} (${Math.round(delay/60000)}min from now) → ${m.channel}`);
                             const to = setTimeout(async () => {
                                 try {
-                                    const ch = await client.channels.fetch(m.channel).catch(() => null)
-                                        || client.channels.cache.find(c => c.name === m.channel);
+                                    const ch = await resolveHomeChannel(m.channel);
                                     if (ch?.isTextBased()) {
                                         await ch.send(m.content);
                                         console.log(`✅ Sent scheduled message to ${m.channel}`);
@@ -12832,8 +12851,7 @@ client.on('guildMemberAdd', async member => {
     const msgs = autoMessagesStore.filter(m => m.trigger === 'join');
     for (const m of msgs) {
         try {
-            const ch = await client.channels.fetch(m.channel).catch(() => null)
-                || client.channels.cache.find(c => c.name === m.channel);
+            const ch = await resolveHomeChannel(m.channel);
             if (ch?.isTextBased()) {
                 const text = m.content.replace(/\{user\}/g, `<@${member.id}>`).replace(/\{username\}/g, member.user.username);
                 await ch.send(text);
@@ -12848,8 +12866,7 @@ client.on('guildMemberRemove', async member => {
     const msgs = autoMessagesStore.filter(m => m.trigger === 'leave');
     for (const m of msgs) {
         try {
-            const ch = await client.channels.fetch(m.channel).catch(() => null)
-                || client.channels.cache.find(c => c.name === m.channel);
+            const ch = await resolveHomeChannel(m.channel);
             if (ch?.isTextBased()) {
                 const text = m.content.replace(/\{user\}/g, member.user.username).replace(/\{username\}/g, member.user.username);
                 await ch.send(text);
