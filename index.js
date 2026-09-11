@@ -25,11 +25,47 @@ function shubbaLogError(tag, err) {
  *
  * DEV_GUILD_ID is declared further down the file. That is fine: this function is
  * only ever CALLED at request/event time, long after module evaluation, so the
- * const is initialised by then. Falls back to `.first()` if the id cannot be
- * resolved, so a mis-set id degrades to the old behaviour instead of throwing.
+ * const is initialised by then.
+ *
+ * NO fallback. This used to fall back to `.first()` so a mis-set id would
+ * "degrade to the old behaviour" — but with Shubba in a second (staging) guild,
+ * the old behaviour is binding role audits, reconciliation and dashboard bans to
+ * whichever guild happens to be cached first. Returning null is the safe
+ * failure; every caller already handles it.
  */
 function getHomeGuild() {
-    return client.guilds.cache.get(DEV_GUILD_ID) || client.guilds.cache.first();
+    return client.guilds.cache.get(DEV_GUILD_ID) || null;
+}
+
+/**
+ * Guilds whose EVENTS this process acts on. Everything else is ignored.
+ *
+ * Shubba was invited to a staging server, and not one event handler checked
+ * which guild an event came from. The same process that runs the live server
+ * would therefore have:
+ *   • posted its live join/leave auto-messages, in LIVE channels, for people
+ *     joining STAGING;
+ *   • fed staging messages into live's spam tracker and soft-ban logic;
+ *   • let a dev command typed in staging write to the persisted knowledge that
+ *     every live answer is built from — so anything said about an unannounced
+ *     project in staging could surface in a public support reply.
+ *
+ * A staging instance can opt in with SHUBBA_GUILD_IDS (comma-separated); the
+ * live deployment leaves it unset and hears only the live guild.
+ */
+function allowedGuildIds() {
+    const raw = process.env.SHUBBA_GUILD_IDS;
+    const ids = (raw ? raw.split(',') : [DEV_GUILD_ID]).map(s => s.trim()).filter(Boolean);
+    return new Set(ids);
+}
+
+/**
+ * True when an event belongs to a guild this process must not act on.
+ * DMs carry no guild id and are NOT foreign — they keep their existing handling.
+ */
+function isForeignGuild(guildId) {
+    if (!guildId) return false;
+    return !allowedGuildIds().has(String(guildId));
 }
 process.on('unhandledRejection', (e) => { console.error('unhandledRejection:', e); shubbaLogError('unhandledRejection', e); });
 process.on('uncaughtException',  (e) => { console.error('uncaughtException:', e);  shubbaLogError('uncaughtException', e); });
@@ -8752,6 +8788,8 @@ process.on('unhandledRejection', (error) => {
 // helper, which dedupes on message/thread ID — so whichever path observes an
 // action first counts it, and the others become no-ops.
 client.on('raw', (packet) => {
+    // Staging and any other guild: not ours to act on. See isForeignGuild().
+    if (isForeignGuild(packet?.d?.guild_id)) return;
     if (packet.t !== 'MESSAGE_CREATE') return;
     const d = packet.d;
     if (!d || !d.guild_id) return;
@@ -8949,6 +8987,8 @@ client.once(Events.ClientReady, async (readyClient) => {
 setInterval(studyEverything, 60 * 60 * 1000);
 
 client.on(Events.ThreadCreate, async (thread) => {
+  // Staging and any other guild: not ours to act on. See isForeignGuild().
+  if (isForeignGuild(thread.guildId)) return;
 
   // ── FORUM SPAM DETECTION ──────────────────────────────────────────────────
   // Scammers now create posts in forums in addition to sending messages.
@@ -9428,6 +9468,8 @@ const mentionGate = createMentionGate({
 // ─────────────────────────────────────────────────────────────────────────────
 
 client.on(Events.MessageCreate, async (message) => {
+    // Staging and any other guild: not ours to act on. See isForeignGuild().
+    if (isForeignGuild(message.guildId)) return;
     // ── INSTANT KILL PATHS (run first, before anything else) ─────────────────
     // These run on the event loop tick of the message arrival. We want zero
     // latency between Discord delivering the message and the kick API call
@@ -10919,6 +10961,8 @@ async function enqueueUserCommand(userId, fn) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 client.on(Events.InteractionCreate, async (interaction) => {
+    // Staging and any other guild: not ours to act on. See isForeignGuild().
+    if (isForeignGuild(interaction.guildId)) return;
     // Buttons, modal submits and select menus acknowledge inside their own
     // branches — they don't need queueing.
     if (!interaction.isChatInputCommand()) {
@@ -12683,6 +12727,8 @@ client.login(DISCORD_TOKEN);
 
 // ── Reaction Role Handler ─────────────────────────────────────
 client.on('messageReactionAdd', async (reaction, user) => {
+    // Staging and any other guild: not ours to act on. See isForeignGuild().
+    if (isForeignGuild(reaction.message?.guildId ?? reaction.message?.channel?.guildId)) return;
     if (user.bot) return;
     if (reaction.partial) { try { await reaction.fetch(); } catch(e) { return; } }
 
@@ -12740,6 +12786,8 @@ client.on('messageReactionAdd', async (reaction, user) => {
 });
 
 client.on('messageReactionRemove', async (reaction, user) => {
+    // Staging and any other guild: not ours to act on. See isForeignGuild().
+    if (isForeignGuild(reaction.message?.guildId ?? reaction.message?.channel?.guildId)) return;
     if (user.bot) return;
     if (reaction.partial) { try { await reaction.fetch(); } catch(e) { return; } }
 
@@ -12779,6 +12827,8 @@ client.on('messageReactionRemove', async (reaction, user) => {
 
 // ── Auto Message: Join/Leave ──────────────────────────────────
 client.on('guildMemberAdd', async member => {
+    // Staging and any other guild: not ours to act on. See isForeignGuild().
+    if (isForeignGuild(member.guild?.id)) return;
     const msgs = autoMessagesStore.filter(m => m.trigger === 'join');
     for (const m of msgs) {
         try {
@@ -12793,6 +12843,8 @@ client.on('guildMemberAdd', async member => {
 });
 
 client.on('guildMemberRemove', async member => {
+    // Staging and any other guild: not ours to act on. See isForeignGuild().
+    if (isForeignGuild(member.guild?.id)) return;
     const msgs = autoMessagesStore.filter(m => m.trigger === 'leave');
     for (const m of msgs) {
         try {
