@@ -54,11 +54,23 @@ const MOD_SCOPE_TAGS = new Set(['Punchy', 'EFL', 'Better Fishing']);
 
 // ─── Server-wide layout ─────────────────────────────────────────────────────
 
-const HOME = { from: '📌 IMPORTANT', name: '🏠 HOME' };   // welcome, rules, FAQ, server updates, music, boosters
-const REMOVED_CHANNELS = ['🐛│killed-bug', '📋│roadmap-board'];
+// Server-wide channels: welcome, rules, the general FAQ, server updates, music,
+// boosters — plus commands and the flytrap honeypot, moved in from 💬 GENERAL.
+// (The flytrap is found by id in Shubba's spam detection, so moving it between
+// categories changes nothing there.)
+const HOME = { from: '📌 IMPORTANT', name: '🏠 HOME', adopt: ['🤖│commands', 'dont-message-here-flytrap'] };
+const REMOVED_CHANNELS = [
+    '🐛│killed-bug', '📋│roadmap-board', 'peak',
+    // Built by an earlier version, before Punchy! adopted the original general chats.
+    '💬│punchy-general-en', '💬│punchy-general-br', '💬│punchy-general-es', '💬│punchy-general-ru',
+];
 // Emptied by moving their channels into mod categories.
 const REMOVED_CATEGORIES_IF_EMPTY = ['🧠 FORUMS'];
 const PLACE_MOD_CATEGORIES_AFTER = 'YOUR CREATIONS';
+// Channels everyone can post in, kept as onboarding defaults. Discord requires
+// at least 5 such defaults; the general chats used to supply them, but they
+// are Punchy!'s now and gated.
+const PUBLIC_DEFAULTS = ['🤖│commands', '🌇│gallery', '🧱│minecraft-showcase'];
 
 // ─── Channel templates ──────────────────────────────────────────────────────
 
@@ -150,13 +162,14 @@ const MODS = [
         // Live's Punchy! channels, moved into this category as they are.
         adopt: [
             '📢│announcements', '🎬│teasers', '⬆️│addon-updates', '🛠️│known-issues',
+            '💬│general-en', '💬│general-br', '💬│general-es', '💬│general-ru',   // the original chats ARE Punchy!'s
             '🪲│bug-report', '⁉️│wiki-questions', '💡│suggestions', '📦│addons',
         ],
         // Its own FAQ; the existing ❓│faq stays in HOME for general questions.
-        build: ['faq', 'chats'],
+        build: ['faq'],
         order: [
             '📢│announcements', '🎬│teasers', '⬆️│addon-updates', '❓│punchy-faq', '🛠️│known-issues',
-            '💬│punchy-general-en', '💬│punchy-general-br', '💬│punchy-general-es', '💬│punchy-general-ru',
+            '💬│general-en', '💬│general-br', '💬│general-es', '💬│general-ru',
             '🪲│bug-report', '⁉️│wiki-questions', '💡│suggestions', '📦│addons',
         ],
     },
@@ -241,7 +254,10 @@ for (const m of MODS) {
 const LAYOUT = {
     omit: [...REMOVED_CHANNELS, ...REMOVED_CATEGORIES_IF_EMPTY],
     categoryAlias: { [HOME.from]: HOME.name },
-    relocate: Object.fromEntries(MODS.flatMap(m => m.adopt.map(name => [name, m.category]))),
+    relocate: Object.fromEntries([
+        ...MODS.flatMap(m => m.adopt.map(name => [name, m.category])),
+        ...HOME.adopt.map(name => [name, HOME.name]),
+    ]),
 };
 
 const MODS_PROMPT_TITLE = 'Which mods are you here for?';
@@ -452,8 +468,23 @@ async function run(d, { apply, log = console.log } = {}) {
     }
     if (home) {
         home.name = HOME.name;
-        say(`   [${HOME.name}] keeps: ${channels.filter(c => c.parent_id === home.id && !made.has(c.name) && !REMOVED_CHANNELS.includes(c.name))
-            .sort((a, b) => a.position - b.position).map(c => c.name.split('│').pop()).join(', ')}`);
+        // Pull in the server-wide channels that lived in other categories.
+        for (const name of HOME.adopt) {
+            const ch = byName(channels, name)[0];
+            if (!ch) { say(`   ⚠ #${name} not found — cannot move it into HOME`); continue; }
+            if (ch.parent_id !== home.id) {
+                await d.req('PATCH', `/channels/${ch.id}`, { parent_id: home.id, lock_permissions: false });
+                ch.parent_id = home.id;
+                say(`   moved #${name} into [${HOME.name}]`);
+            }
+        }
+        // HOME order: what it already had, then the adopted channels at the end.
+        const homeKids = channels
+            .filter(c => c.parent_id === home.id && !made.has(c.name) && !REMOVED_CHANNELS.includes(c.name))
+            .sort((a, b) => (HOME.adopt.includes(a.name) - HOME.adopt.includes(b.name)) || (a.position - b.position)
+                || (HOME.adopt.indexOf(a.name) - HOME.adopt.indexOf(b.name)));
+        await d.req('PATCH', `/guilds/${STAGING_GUILD}/channels`, homeKids.map((c, i) => ({ id: c.id, position: i })));
+        say(`   [${HOME.name}]: ${homeKids.map(c => c.name.split('│').pop()).join(', ')}`);
     }
 
     // Removed first from onboarding (a PUT naming a deleted channel is
@@ -491,7 +522,10 @@ async function run(d, { apply, log = console.log } = {}) {
 
     // 1. "Which mods are you here for?" — first, required, multi-select.
     const oldMods = prompts.find(p => p.title === MODS_PROMPT_TITLE || LEGACY_MODS_PROMPT_TITLES.includes(p.title));
-    const langNames = new Set(MODS.flatMap(m => m.channels.filter(c => c.lang).map(c => c.name)));
+    const langNames = new Set([
+        ...MODS.flatMap(m => m.channels.filter(c => c.lang).map(c => c.name)),
+        ...LANGS.map(l => `💬│general-${l.code}`),   // Punchy!'s adopted chats
+    ]);
     const modsPrompt = {
         id: oldMods?.id || newSnowflake(),
         type: 0,
@@ -561,7 +595,11 @@ async function run(d, { apply, log = console.log } = {}) {
     const body = {
         prompts,
         // Gated or removed channels cannot be everyone's defaults.
-        default_channel_ids: ob.default_channel_ids.filter(id => !gatedIds.has(id) && !removeIds.has(id)
+        // The public community channels join the defaults: once the general chats
+        // became Punchy!'s (gated), they could no longer count toward Discord's
+        // minimum of default channels members can post in.
+        default_channel_ids: [...new Set([...ob.default_channel_ids,
+            ...PUBLIC_DEFAULTS.map(n => byName(channels, n)[0]?.id).filter(Boolean)])].filter(id => !gatedIds.has(id) && !removeIds.has(id)
             && !channels.some(c => c.id === id && removedCatNames.has(c.name))),
         enabled: ob.enabled,
         mode: ob.mode,

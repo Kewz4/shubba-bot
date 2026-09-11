@@ -51,7 +51,7 @@ test('the fishing mods have no wiki, as asked; Moves does', () => {
     assert.ok(names(byKey.moves).some(n => n.includes('wiki')));
 });
 
-test('no mod-channel name collides with anything live has — or the sync would claim it as a live twin', () => {
+test('no BUILT mod-channel name collides with anything live has — or the sync would claim it as a live twin', () => {
     const live = new Set([
         '📢│announcements', '🎬│teasers', '💬│general-en', '💬│general-br', '💬│general-es', '💬│general-ru',
         '🪲│bug-report', '⁉️│wiki-questions', '💡│suggestions', '📦│addons',
@@ -165,7 +165,7 @@ test('known-issues moves out of HOME into Punchy!', () => {
 });
 
 test('killed-bug and roadmap are removed, and a sync will not recreate them', () => {
-    assert.deepEqual([...REMOVED_CHANNELS].sort(), ['🐛│killed-bug', '📋│roadmap-board'].sort());
+    for (const n of ['🐛│killed-bug', '📋│roadmap-board']) assert.ok(REMOVED_CHANNELS.includes(n), `${n} is not removed`);
     for (const n of REMOVED_CHANNELS) assert.ok(LAYOUT.omit.includes(n));
 });
 
@@ -177,9 +177,10 @@ test('every adopted channel tells the sync where it now lives', () => {
     for (const m of MODS) for (const n of m.adopt) assert.equal(LAYOUT.relocate[n], m.category);
 });
 
-test('Punchy! has its own four language chats, like every other mod', () => {
-    const langs = byKey.punchy.channels.filter(c => c.lang).map(c => c.lang).sort();
-    assert.deepEqual(langs, LANGS.map(l => l.code).sort());
+test('the four language chats of Punchy! are the ORIGINAL general chats, adopted', () => {
+    for (const l of LANGS) assert.ok(byKey.punchy.adopt.includes(`💬│general-${l.code}`), `general-${l.code} not adopted`);
+    assert.ok(!byKey.punchy.channels.some(c => c.lang), 'Punchy! must not ALSO build its own chats');
+    for (const l of LANGS) assert.ok(REMOVED_CHANNELS.includes(`💬│punchy-general-${l.code}`), 'the built duplicates must be retired');
 });
 
 test('each category lists every one of its channels exactly once', () => {
@@ -187,4 +188,16 @@ test('each category lists every one of its channels exactly once', () => {
         const expected = [...m.adopt, ...names(m)].sort();
         assert.deepEqual([...m.order].sort(), expected, `${m.name}: order and channels disagree`);
     }
+});
+
+test('commands and the flytrap live in HOME; #peak is removed', () => {
+    assert.ok(HOME.adopt.includes('🤖│commands'));
+    assert.ok(HOME.adopt.includes('dont-message-here-flytrap'));
+    assert.equal(LAYOUT.relocate['🤖│commands'], HOME.name, 'the sync must not move commands back to 💬 GENERAL');
+    assert.equal(LAYOUT.relocate['dont-message-here-flytrap'], HOME.name);
+    assert.ok(REMOVED_CHANNELS.includes('peak') && LAYOUT.omit.includes('peak'));
+});
+
+test('HOME holds no general chat', () => {
+    for (const n of HOME.adopt) assert.doesNotMatch(n, /general/, `${n} is a general chat and must not be in HOME`);
 });
