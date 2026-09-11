@@ -5,6 +5,8 @@
  *
  *   node scripts/staging-sync.js            # dry run: print every write it would make
  *   node scripts/staging-sync.js --apply    # perform them
+ *     --prune     also delete staging-only roles/channels (normally KEPT)
+ *     --no-mods   mirror live only; skip re-applying scripts/staging-mods.js
  *
  * Structure only: guild settings, roles, channels, permission overwrites, forum
  * tags, emojis, stickers, AutoMod and onboarding. NEVER messages, NEVER members.
@@ -467,12 +469,24 @@ async function main() {
     const isTextish = t => t === T.TEXT || t === T.NEWS;
     const typeClass = t => isTextish(t) ? 'text' : String(t);
 
-    // Categories first, matched by name.
+    // Staging's own layout (scripts/staging-mods.js) moves, renames and removes
+    // some of live's channels. Honour it, or every sync would undo it: recreate
+    // what was removed, move relocated channels back, rename categories back.
+    // --no-mods means a pure mirror, so no overrides.
+    const LAYOUT = process.argv.includes('--no-mods')
+        ? { omit: [], categoryAlias: {}, relocate: {} }
+        : require('./staging-mods').LAYOUT;
+    const omitted = new Set(LAYOUT.omit);
+    const aliasOf = (name) => LAYOUT.categoryAlias[name] || name;
+
+    // Categories first, matched by name (or by the name staging gives them).
     const liveCats = L.channels.filter(c => c.type === T.CATEGORY).sort((a, b) => a.position - b.position);
     const stagingCats = S.channels.filter(c => c.type === T.CATEGORY);
     for (const lc of liveCats) {
-        const have = stagingCats.find(c => c.name === lc.name && !chanMap.has(c.id) && ![...chanMap.values()].includes(c.id));
+        const have = stagingCats.find(c => (c.name === lc.name || c.name === aliasOf(lc.name))
+            && !chanMap.has(c.id) && ![...chanMap.values()].includes(c.id));
         if (have) { chanMap.set(lc.id, have.id); continue; }
+        if (omitted.has(lc.name)) { note(`   not recreating [${lc.name}] — staging's layout removes it`); continue; }
         const created = await d.req('POST', `/guilds/${STAGING_GUILD}/channels`, { name: lc.name, type: T.CATEGORY });
         d.markStagingChannel(created);
         chanMap.set(lc.id, created.id);
@@ -491,6 +505,7 @@ async function main() {
         const loose = have || S.channels.find(c => c.type !== T.CATEGORY && !used.has(c.id)
             && c.name === lc.name && typeClass(c.type) === typeClass(lc.type));
         if (loose) { chanMap.set(lc.id, loose.id); used.add(loose.id); }
+        else if (omitted.has(lc.name)) note(`   not recreating #${lc.name} — staging's layout removes it`);
         else pendingCreate.push(lc);
     }
 
@@ -603,7 +618,7 @@ async function main() {
         if (!sid || pendingCreate.includes(lc)) continue;
         const twin = S.channels.find(c => c.id === sid);
         const body = lc.type === T.CATEGORY
-            ? { name: lc.name, permission_overwrites: mapOverwrites(lc) }
+            ? { name: aliasOf(lc.name), permission_overwrites: mapOverwrites(lc) }
             : channelProps(lc, twin);
         if (twin && isTextish(lc.type) && twin.type !== lc.type) body.type = lc.type;   // text ↔ announcement
         await d.req('PATCH', `/channels/${sid}`, body);
@@ -625,14 +640,25 @@ async function main() {
     // Positions + parents. Discord allows only ONE category change per bulk call,
     // and treats any entry that merely includes parent_id as a change — so
     // category moves go one at a time, and the bulk call carries positions only.
+    const current = APPLY ? await d.get(`/guilds/${STAGING_GUILD}/channels`) : S.channels;
+    const currentParent = new Map(current.map(c => [c.id, c.parent_id || null]));
+    // A relocated channel belongs to the staging category the layout names —
+    // if that category exists yet. If not, leave it where it is; staging-mods
+    // will create the category and move it.
+    const parentFor = (lc) => {
+        const target = LAYOUT.relocate[lc.name];
+        if (target) {
+            const cat = current.find(c => c.type === T.CATEGORY && c.name === target);
+            return cat ? cat.id : (currentParent.get(chanMap.get(lc.id)) ?? null);
+        }
+        return lc.parent_id ? (chanMap.get(lc.parent_id) || null) : null;
+    };
     const layout = [...liveCats, ...liveRest].filter(lc => chanMap.has(lc.id)).map(lc => ({
         id: chanMap.get(lc.id),
         position: lc.position,
-        parent_id: lc.parent_id ? (chanMap.get(lc.parent_id) || null) : null,
+        parent_id: parentFor(lc),
         isCategory: lc.type === T.CATEGORY,
     }));
-    const current = APPLY ? await d.get(`/guilds/${STAGING_GUILD}/channels`) : S.channels;
-    const currentParent = new Map(current.map(c => [c.id, c.parent_id || null]));
     const moves = layout.filter(l => !l.isCategory && currentParent.has(l.id) && currentParent.get(l.id) !== l.parent_id);
     for (const mv of moves) {
         await d.req('PATCH', `/guilds/${STAGING_GUILD}/channels`,
@@ -751,6 +777,16 @@ async function main() {
         } catch (e) {
             skip(`onboarding — Discord rejected it: ${e.message}`);
         }
+    }
+
+    // ── 8. Staging's own structure, on top of the mirror ─────────────────────
+    // Mirroring live just reset Punchy!'s channel permissions to live's, which
+    // ungates them. Re-apply the multi-mod layer (access roles, per-mod
+    // categories, gated channels, onboarding) so a sync never leaves staging
+    // half-built. --no-mods mirrors live and stops.
+    if (!process.argv.includes('--no-mods')) {
+        note('\n── 8. staging mods layer (scripts/staging-mods.js)');
+        await require('./staging-mods').run(d, { apply: APPLY, log: (s) => note(s.replace(/^/gm, '   ')) });
     }
 
     // ── Report ───────────────────────────────────────────────────────────────
