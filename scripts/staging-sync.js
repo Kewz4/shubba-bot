@@ -33,6 +33,9 @@ const STAGING_GUILD = '1523847700037107742';  // staging — the ONLY write targ
 const BOT_ID = '1465165237358559386';
 
 const APPLY = process.argv.includes('--apply');
+// Staging is where new things get built (the Punchy! Moves section, first).
+// Anything staging has that live does not is KEPT unless --prune is given.
+const PRUNE = process.argv.includes('--prune');
 const REPO = path.resolve(__dirname, '..');
 const REPORT = path.join(os.tmpdir(), 'staging-sync-report.json');
 
@@ -99,7 +102,9 @@ class GuardedDiscord {
             if (!APPLY) {
                 // Dry run: pretend it worked, and hand back a stand-in id so later
                 // steps can plan against it. Stand-ins are registered as staging.
-                const fake = `dry${String(++this.fakeSeq).padStart(15, '0')}`;
+                // Snowflake-shaped so later writes to it route like a real id and
+                // face the same guard. Never sent: this branch only runs dry.
+                const fake = (9000000000000000000n + BigInt(++this.fakeSeq)).toString();
                 return { id: fake, guild_id: STAGING_GUILD, __dry: true };
             }
         }
@@ -138,6 +143,86 @@ function summarize(body) {
     for (const k of ['icon', 'image', 'banner', 'splash']) if (typeof b[k] === 'string' && b[k].length > 80) b[k] = `[${b[k].length} chars]`;
     const s = JSON.stringify(b);
     return s.length > 300 ? s.slice(0, 300) + '…' : s;
+}
+
+/**
+ * Order a list the way live orders it, while keeping staging-only items where
+ * they are relative to their neighbours.
+ *
+ * `liveOrder` is staging ids in live's order (bottom → top, or any consistent
+ * direction). `currentOrder` is staging ids as staging has them now, same
+ * direction. Each staging-only item is anchored to the nearest non-staging-only
+ * item before it in `currentOrder`, and re-inserted right after that anchor —
+ * or at the very start if nothing precedes it.
+ */
+function mergeOrder(liveOrder, currentOrder, isStagingOnly) {
+    const anchored = new Map();   // anchor id (or null) -> staging-only ids, in order
+    let anchor = null;
+    for (const id of currentOrder) {
+        if (isStagingOnly(id)) {
+            if (!anchored.has(anchor)) anchored.set(anchor, []);
+            anchored.get(anchor).push(id);
+        } else if (liveOrder.includes(id)) {
+            anchor = id;
+        }
+    }
+    const out = [...(anchored.get(null) || [])];
+    for (const id of liveOrder) {
+        out.push(id);
+        out.push(...(anchored.get(id) || []));
+    }
+    return out;
+}
+
+/** An onboarding option as GET returns it → the shape PUT accepts. */
+function reshapeOption(o) {
+    const out = { id: o.id, title: o.title, description: o.description, channel_ids: o.channel_ids || [], role_ids: o.role_ids || [] };
+    if (o.emoji?.id) { out.emoji_id = o.emoji.id; out.emoji_name = o.emoji.name; out.emoji_animated = !!o.emoji.animated; }
+    else if (o.emoji?.name) out.emoji_name = o.emoji.name;
+    else if (o.emoji_name || o.emoji_id) { out.emoji_id = o.emoji_id; out.emoji_name = o.emoji_name; out.emoji_animated = o.emoji_animated; }
+    return out;
+}
+function reshapePrompt(p) {
+    return { id: p.id, type: p.type, title: p.title, single_select: p.single_select, required: p.required, in_onboarding: p.in_onboarding, options: (p.options || []).map(reshapeOption) };
+}
+
+/**
+ * Merge live's onboarding (already remapped to staging ids) into staging's,
+ * without losing what was built in staging.
+ *
+ * Live is authoritative for everything it has. On top of that, staging keeps:
+ *   • prompts live does not have (e.g. "Which Punchy! mods are you here for?"),
+ *   • options live does not have inside a shared prompt (e.g. "Punchy! Moves
+ *     Updates" inside the notifications prompt),
+ *   • role/channel grants on a shared option that point at staging-only things
+ *     (e.g. "Everything" also granting the Moves roles).
+ * Prompt and option ids are reused where titles match, so ids stay stable, and
+ * staging's prompt ORDER is kept — the Moves question stays first.
+ */
+function mergeOnboarding(livePrompts, stagingPrompts, isKeptRole, isKeptChannel) {
+    const uniq = a => [...new Set(a)];
+    const stByTitle = new Map((stagingPrompts || []).map(p => [p.title, p]));
+    const merged = new Map();
+    for (const lp of livePrompts) {
+        const sp = stByTitle.get(lp.title);
+        const spOpts = new Map((sp?.options || []).map(o => [o.title, o]));
+        const liveOptTitles = new Set(lp.options.map(o => o.title));
+        const options = lp.options.map(lo => {
+            const so = spOpts.get(lo.title);
+            return {
+                ...lo,
+                id: so?.id || lo.id,
+                role_ids: uniq([...lo.role_ids, ...(so?.role_ids || []).filter(isKeptRole)]),
+                channel_ids: uniq([...lo.channel_ids, ...(so?.channel_ids || []).filter(isKeptChannel)]),
+            };
+        });
+        for (const so of sp?.options || []) if (!liveOptTitles.has(so.title)) options.push(reshapeOption(so));
+        merged.set(lp.title, { ...lp, id: sp?.id || lp.id, options });
+    }
+    const out = [];
+    for (const sp of stagingPrompts || []) out.push(merged.get(sp.title) || reshapePrompt(sp));
+    for (const lp of livePrompts) if (!stByTitle.has(lp.title)) out.push(merged.get(lp.title));
+    return out;
 }
 
 // Onboarding prompts/options need client-generated snowflakes.
@@ -272,14 +357,17 @@ async function main() {
         }
     }
 
-    // Staging roles with no live counterpart are stale leftovers from an older
-    // clone (renamed addon roles). Staging has no content, so they go.
-    for (const sr of S.roles) {
-        if (sr.id === STAGING_GUILD || sr.managed || claimed.has(sr.id)) continue;
-        if (!manageable(sr)) { skip(`stale staging role "${sr.name}" sits above the bot — delete it by hand`); continue; }
+    // Staging roles with no live counterpart are either leftovers from an older
+    // clone or something being BUILT in staging (Punchy! Moves). The sync
+    // cannot tell which, so it keeps them unless told to --prune.
+    const stagingOnlyRoles = S.roles.filter(sr => sr.id !== STAGING_GUILD && !sr.managed && !claimed.has(sr.id));
+    for (const sr of stagingOnlyRoles) {
+        if (!PRUNE) { note(`   kept staging-only role "${sr.name}" (use --prune to remove)`); continue; }
+        if (!manageable(sr)) { skip(`staging-only role "${sr.name}" sits above the bot — delete it by hand`); continue; }
         await d.req('DELETE', `/guilds/${STAGING_GUILD}/roles/${sr.id}`);
-        note(`   deleted stale staging role "${sr.name}"`);
+        note(`   pruned staging-only role "${sr.name}"`);
     }
+    const keptRoleIds = new Set(PRUNE ? [] : stagingOnlyRoles.map(r => r.id));
 
     // Order: mirror live, for every role the bot is allowed to move.
     if (APPLY) S = await readStaging(d);
@@ -289,9 +377,16 @@ async function main() {
     const stagingPos = new Map(S.roles.map(r => [r.id, r.position]));
     const movable = orderable.filter(o => APPLY ? (stagingPos.get(o.id) ?? 0) < botTop : true);
     if (movable.length) {
-        // Assign contiguous positions from the bottom, in live's order, below the bot.
-        const sorted = [...movable].sort((a, b) => a.livePos - b.livePos);
-        const positions = sorted.map((o, i) => ({ id: o.id, position: i + 1 }));
+        // Assign contiguous positions from the bottom, in live's order, below the
+        // bot — with any kept staging-only role re-inserted next to the role it
+        // currently sits above, so building something in staging survives a sync.
+        const liveOrder = [...movable].sort((a, b) => a.livePos - b.livePos).map(o => o.id);
+        const currentOrder = S.roles
+            .filter(r => r.id !== STAGING_GUILD && (liveOrder.includes(r.id) || keptRoleIds.has(r.id)))
+            .sort((a, b) => a.position - b.position || (BigInt(a.id) < BigInt(b.id) ? -1 : 1))
+            .map(r => r.id);
+        const merged = mergeOrder(liveOrder, currentOrder, id => keptRoleIds.has(id));
+        const positions = merged.map((id, i) => ({ id, position: i + 1 }));
         // Positions are plain integers and a bot may only assign ones BELOW its
         // own. Newly created roles all land on position 1, and Discord does not
         // renumber until someone drags a role in the client — so a bot "at the
@@ -457,6 +552,11 @@ async function main() {
             if (lc.default_sort_order != null) p.default_sort_order = lc.default_sort_order;
             if (lc.default_forum_layout != null) p.default_forum_layout = lc.default_forum_layout;
             if (lc.default_thread_rate_limit_per_user != null) p.default_thread_rate_limit_per_user = lc.default_thread_rate_limit_per_user;
+            // AND vs OR when a member filters the forum by several tags. Not in
+            // Discord's public docs, but returned and writable — and live's
+            // #bug-report uses match_all, which an independent check caught us
+            // dropping.
+            if (lc.default_tag_setting) p.default_tag_setting = lc.default_tag_setting;
             p.flags = lc.flags || 0;   // REQUIRE_TAG lives here
         }
         return p;
@@ -486,9 +586,14 @@ async function main() {
     for (const lc of pendingCreate) {
         const parent = lc.parent_id ? chanMap.get(lc.parent_id) : null;
         const body = { ...channelProps(lc, null), type: lc.type, parent_id: parent || null };
+        // REQUIRE_TAG is checked against the forum's current tags (none, on
+        // create) and rejected with 40066 — set it once the tags exist.
+        const flags = body.flags;
+        delete body.flags;
         const created = await d.req('POST', `/guilds/${STAGING_GUILD}/channels`, body);
         d.markStagingChannel(created);
         chanMap.set(lc.id, created.id);
+        if (flags) await d.req('PATCH', `/channels/${created.id}`, { flags });
         note(`   created ${lc.type === T.NEWS ? 'announcement' : lc.type === T.FORUM ? 'forum' : 'channel'} #${lc.name}`);
     }
 
@@ -505,9 +610,16 @@ async function main() {
     }
     note(`   updated ${[...liveCats, ...liveRest].filter(lc => chanMap.has(lc.id) && !pendingCreate.includes(lc)).length} existing channels to live's topics, overwrites, tags and settings`);
 
+    // Channels staging has and live does not: kept (and left untouched) unless
+    // --prune. This is where things are built before they ship to live.
+    const keptChannelIds = new Set();
     for (const c of extraStaging) {
+        if (!PRUNE) { keptChannelIds.add(c.id); continue; }
         await d.req('DELETE', `/channels/${c.id}`);
-        note(`   deleted staging-only channel #${c.name}`);
+        note(`   pruned staging-only channel #${c.name}`);
+    }
+    if (keptChannelIds.size) {
+        note(`   kept ${keptChannelIds.size} staging-only channel(s) untouched: ${extraStaging.map(c => (c.type === T.CATEGORY ? '[' + c.name + ']' : '#' + c.name)).join(', ')}`);
     }
 
     // Positions + parents. Discord allows only ONE category change per bulk call,
@@ -517,15 +629,25 @@ async function main() {
         id: chanMap.get(lc.id),
         position: lc.position,
         parent_id: lc.parent_id ? (chanMap.get(lc.parent_id) || null) : null,
+        isCategory: lc.type === T.CATEGORY,
     }));
     const current = APPLY ? await d.get(`/guilds/${STAGING_GUILD}/channels`) : S.channels;
     const currentParent = new Map(current.map(c => [c.id, c.parent_id || null]));
-    const moves = layout.filter(l => currentParent.has(l.id) && currentParent.get(l.id) !== l.parent_id);
+    const moves = layout.filter(l => !l.isCategory && currentParent.has(l.id) && currentParent.get(l.id) !== l.parent_id);
     for (const mv of moves) {
         await d.req('PATCH', `/guilds/${STAGING_GUILD}/channels`,
             [{ id: mv.id, parent_id: mv.parent_id, lock_permissions: false }]);
     }
-    await d.req('PATCH', `/guilds/${STAGING_GUILD}/channels`, layout.map(({ id, position }) => ({ id, position })));
+    // Categories by index, in live's order, with kept staging-only categories
+    // (e.g. 🕺 PUNCHY! MOVES) staying next to the category they follow now.
+    const liveCatOrder = layout.filter(l => l.isCategory).sort((a, b) => a.position - b.position).map(l => l.id);
+    const currentCatOrder = current.filter(c => c.type === T.CATEGORY)
+        .sort((a, b) => a.position - b.position || (BigInt(a.id) < BigInt(b.id) ? -1 : 1)).map(c => c.id);
+    const catOrder = mergeOrder(liveCatOrder, currentCatOrder, id => keptChannelIds.has(id));
+    await d.req('PATCH', `/guilds/${STAGING_GUILD}/channels`, [
+        ...catOrder.map((id, i) => ({ id, position: i })),
+        ...layout.filter(l => !l.isCategory).map(({ id, position }) => ({ id, position })),
+    ]);
     note(`   laid out ${layout.length} channels in live's order (${moves.length} moved category)`);
 
     // ── 5b. Settings that point at channels ─────────────────────────────────
@@ -607,15 +729,25 @@ async function main() {
                 return opt;
             }),
         }));
+        // Merge rather than replace — a PUT replaces the whole configuration, and
+        // staging carries prompts and options that live does not have yet.
+        const stagingOb = await d.get(`/guilds/${STAGING_GUILD}/onboarding`).catch(() => null);
+        const isKeptRole = id => !PRUNE && keptRoleIds.has(id);
+        const isKeptChannel = id => !PRUNE && keptChannelIds.has(id);
+        const finalPrompts = mergeOnboarding(prompts, stagingOb?.prompts || [], isKeptRole, isKeptChannel);
         const body = {
-            prompts,
-            default_channel_ids: (L.onboarding.default_channel_ids || []).map(id => chanMap.get(id)).filter(Boolean),
+            prompts: finalPrompts,
+            default_channel_ids: [...new Set([
+                ...(L.onboarding.default_channel_ids || []).map(id => chanMap.get(id)).filter(Boolean),
+                ...(stagingOb?.default_channel_ids || []).filter(isKeptChannel),
+            ])],
             enabled: L.onboarding.enabled,
             mode: L.onboarding.mode,
         };
+        const keptPrompts = finalPrompts.length - prompts.length;
         try {
             await d.req('PUT', `/guilds/${STAGING_GUILD}/onboarding`, body);
-            note(`   ${prompts.length} prompts, ${body.default_channel_ids.length} default channels, enabled=${body.enabled}`);
+            note(`   ${finalPrompts.length} prompts (${keptPrompts} staging-only kept), ${body.default_channel_ids.length} default channels, enabled=${body.enabled}`);
         } catch (e) {
             skip(`onboarding — Discord rejected it: ${e.message}`);
         }
@@ -647,4 +779,4 @@ async function readStaging(d) {
     };
 }
 
-module.exports = { GuardedDiscord, LIVE_GUILD, STAGING_GUILD };
+module.exports = { GuardedDiscord, LIVE_GUILD, STAGING_GUILD, mergeOrder, mergeOnboarding, reshapeOption };
